@@ -1,0 +1,33 @@
+[project]
+name = "gpumode"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "jinja2==3.1.6",
+    "numpy==2.4.6",
+    "polars==1.41.2",
+    "rich==15.0.0",
+    "torch==2.12.1",
+]
+
+[project.scripts]
+qr-v2 = "gpumode.qr_v2.cli:main"
+
+[build-system]
+requires = ["uv_build==0.11.19"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "lightning-sdk==2026.6.8.post0",
+    "ruff==0.15.17",
+    "ty==0.0.50",
+]
+
+[tool.ruff]
+cache-dir = ".flox/cache/ruff"
+
+[tool.uv]
+package = true
+python-downloads = "never"
+python-preference = "only-system"

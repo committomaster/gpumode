@@ -1,3 +1,7 @@
 {
-  "recommendations": ["flox.flox"]
+  "recommendations": [
+    "astral-sh.ty",
+    "charliermarsh.ruff",
+    "flox.flox"
+  ]
 }
