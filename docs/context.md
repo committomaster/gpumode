@@ -1,331 +1,165 @@
-# qr_v2 L4 Handoff
+# qr_v2 Handoff
 
 Generated: 2026-06-18
 
-This file summarizes the current project state and the next steps for continuing on the Linux x86_64 NVIDIA L4 host.
+This repository is a local harness and CUDA-candidate workspace for the GPU Mode `qr_v2` problem:
 
-## Current Project Shape
+- Source: https://github.com/gpu-mode/reference-kernels/tree/main/problems/linalg/qr_v2
+- Task metadata: https://raw.githubusercontent.com/gpu-mode/reference-kernels/main/problems/linalg/qr_v2/task.yml
 
-This is a minimal `uv` Python app in a Flox environment.
+## Objective
 
-- Package name: `gpumode`
-- CLI entry point: `qr-v2 = "gpumode.qr_v2.cli:main"`
-- Source layout: flat package under `src/gpumode/qr_v2/`
-- Python requirement: `>=3.13`
-- All generated experiment data should live under `./data/`
-- `uv.toml` was removed; uv config lives in `pyproject.toml`
-- Caches are configured away from the source tree:
-  - Ruff cache: `.flox/cache/ruff`
-  - Python bytecode cache: `.flox/cache/python` via `PYTHONPYCACHEPREFIX`
+Implement batched square compact-Householder QR for CUDA tensors.
 
-Pinned runtime dependencies:
+Input is `A`, shaped `batch x n x n`, `torch.float32`, on CUDA. Output is `(H, tau)` in the same compact convention as `torch.geqrf(A)`: `triu(H)` is `R`, the lower triangle of `H` stores Householder vectors, and `tau` stores reflector coefficients. Correctness is checked against the original FP32 input using `torch.linalg.householder_product(H, tau)`, the factor residual `triu(H) - Q.T @ A`, and orthogonality of `Q`. Returned factors must be FP32 even if a future implementation uses lower precision internally.
 
-- `torch==2.12.1`
-- `numpy==2.4.6`
-- `polars==1.41.2`
-- `jinja2==3.1.6`
-- `rich==15.0.0`
+Important shapes include `n=512` with large batch, plus `1024`, `2048`, and `4096`. The first three official `tests` cases are dense `n=32`, `n=176`, and `n=352`; those are the current correctness gate before broadening.
 
-Pinned dev dependencies:
+## Project Shape
 
-- `ruff==0.15.17`
-- `ty==0.0.50`
-- `lightning-sdk==2026.6.8.post0`
+This is a `uv` Python project inside a self-contained Flox environment.
 
-The Lightning CLI is installed as a local project/dev dependency through uv, not globally.
+- Package: `gpumode`
+- CLI: `qr-v2 = "gpumode.qr_v2.cli:main"`
+- Source: `src/gpumode/qr_v2/`
+- Generated data: `data/qr_v2/...`
+- Python: `>=3.13`, supplied by Flox
+- uv is configured in `pyproject.toml` with `python-downloads = "never"` and `python-preference = "only-system"`
+- Use `flox activate -- ...` from the repo root; do not depend on absolute `.flox/run/...` paths
 
-## Flox State
+Pinned runtime dependencies are `torch==2.12.1`, `numpy==2.4.6`, `polars==1.41.2`, `jinja2==3.1.6`, and `rich==15.0.0`. Dev dependencies are `ruff==0.15.17`, `ty==0.0.50`, and `lightning-sdk==2026.6.8.post0`.
 
-Current `.flox/env/manifest.toml` installs:
+The Flox manifest installs Python 3.13.13, uv 0.11.19, yq, gh, and CUDA 13.0 packages on `x86_64-linux`: `nvcc`, `cudart`, `cccl`, `cuda-gdb`, `cupti`, `cuda_sanitizer_api`, `cuobjdump`, `nvdisasm`, `nvprune`, Nsight Compute, and Nsight Systems. The NVIDIA driver is supplied by the host machine.
 
-- `python313 == python3-3.13.13`
-- `uv == 0.11.19`
-- `gh == 2.94.0`
-- `age == 1.3.1`
-- `sops == 3.13.1`
-- `yq-go == 4.53.3`
-
-Current hook:
+The activation hook sets:
 
 ```sh
 export PYTHONPATH="$FLOX_ENV_PROJECT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPYCACHEPREFIX="$FLOX_ENV_CACHE/python"
-```
-
-Important uv config in `pyproject.toml`:
-
-```toml
-[tool.uv]
-package = true
-python-downloads = "never"
-python-preference = "only-system"
-```
-
-This means uv must use the Flox Python and must not download its own interpreter.
-
-## Implemented qr_v2 Modules
-
-`src/gpumode/qr_v2/specs.py`
-
-- Official smoke/test/benchmark spec definitions.
-
-`src/gpumode/qr_v2/inputs.py`
-
-- Official-style input generation.
-
-`src/gpumode/qr_v2/check.py`
-
-- Compact Householder QR checking helpers.
-
-`src/gpumode/qr_v2/baseline.py`
-
-- Torch `geqrf` baseline runner.
-
-`src/gpumode/qr_v2/probes.py`
-
-- Structure probes for generated inputs.
-
-`src/gpumode/qr_v2/jsonl.py`
-
-- Small JSONL writer helpers.
-
-`src/gpumode/qr_v2/summary.py`
-
-- Polars summaries and Rich/TSV output.
-
-`src/gpumode/qr_v2/render.py`
-
-- Jinja2 CUDA stub rendering.
-- Writes artifacts under `data/qr_v2/renders/<suite>/...`.
-- Writes render manifest at `data/qr_v2/renders/<suite>/manifest.jsonl`.
-- Includes `verify_render_manifest`.
-
-`src/gpumode/qr_v2/compile_plan.py`
-
-- Converts render manifests into future nvcc compile jobs.
-- Writes compile plan at `data/qr_v2/compile-plans/<suite>/manifest.jsonl`.
-- Future compiled outputs are planned under `data/qr_v2/compiled/<suite>/...`.
-- Includes `verify_compile_plan_manifest`.
-
-`src/gpumode/qr_v2/run_plan.py`
-
-- Converts compile plans into future run jobs.
-- Writes run plan at `data/qr_v2/run-plans/<suite>/manifest.jsonl`.
-- Future run/check results are planned under `data/qr_v2/run-results/<suite>/...`.
-- Includes `verify_run_plan_manifest`.
-- Does not require compiled `.so` files to exist yet, so it works on macOS.
-
-`src/gpumode/qr_v2/cli.py`
-
-- Uses `argparse` plus `rich`.
-- Current commands:
-  - `baseline`
-  - `probe`
-  - `summary`
-  - `render`
-  - `verify-renders`
-  - `plan-compile`
-  - `verify-compile-plan`
-  - `plan-run`
-  - `verify-run-plan`
-
-We intentionally did not add `pytest` yet. The current flow is CLI/manifests/JSONL first.
-
-## Current Pipeline
-
-The macOS-side planning pipeline is:
-
-```text
-render
-verify-renders
-plan-compile
-verify-compile-plan
-plan-run
-verify-run-plan
-```
-
-For smoke data, the current generated files are under:
-
-```text
-data/qr_v2/renders/smoke/
-data/qr_v2/compile-plans/smoke/manifest.jsonl
-data/qr_v2/run-plans/smoke/manifest.jsonl
-```
-
-The rendered CUDA files are stubs. They are useful for validating the planning/compile machinery, but they are not the real QR kernel yet.
-
-## Verification Commands Used
-
-These passed on macOS before moving to the L4 work:
-
-```sh
-uv run qr-v2 verify-renders --suite smoke
-uv run qr-v2 verify-compile-plan --suite smoke
-uv run qr-v2 verify-run-plan --suite smoke
-uv run ruff check .
-uv run ty check
-uv sync --check
-env -u PYTHONPATH uv run python -m gpumode.qr_v2.cli verify-run-plan --suite smoke
-```
-
-No stray `__pycache__`, `.ruff_cache`, or egg-info directories were left outside `.flox/cache`.
-
-## L4 Host Notes
-
-Initial L4 info from `l4.txt` / manual commands:
-
-```text
-uname -m: x86_64
-GPU: NVIDIA L4
-Driver Version: 580.159.03
-nvidia-smi CUDA Version: 13.0
-```
-
-Flox is now confirmed to expose the right Python and uv when checked with:
-
-```sh
-flox activate -d . -c 'type -a python python3 uv; python --version; uv --version'
-```
-
-Expected output includes:
-
-```text
-python is .../.flox/run/x86_64-linux.gpumode.dev/bin/python
-Python 3.13.13
-uv 0.11.19
-```
-
-There was one uv interpreter discovery problem on L4:
-
-```text
-uv sync
-error: No interpreter found for Python 3.13 in managed installations
-hint: A managed Python download is available for Python 3.13, but Python downloads are set to 'never'
-```
-
-If that happens, force uv to use Flox Python:
-
-```sh
-flox activate -d .
-echo "$FLOX_ENV"
-"$FLOX_ENV/bin/python" --version
-"$FLOX_ENV/bin/uv" sync --python "$FLOX_ENV/bin/python"
-```
-
-If this works, make it sticky by adding this to the Flox hook:
-
-```sh
+export UV_NO_MANAGED_PYTHON=1
 export UV_PYTHON="$FLOX_ENV/bin/python"
 ```
 
-Do not pin `.python-version` to an absolute `.flox/run/...` path unless it is kept machine-local and not committed.
+## Implemented Harness
 
-## CUDA/Flox Dependencies For L4
+Core modules:
 
-The NVIDIA driver comes from the host, not Flox. Check it with:
+- `specs.py`: smoke/test/benchmark spec definitions.
+- `inputs.py`: official-style input generation.
+- `check.py`: compact Householder QR checker.
+- `baseline.py`: Torch `geqrf` baseline runner.
+- `probes.py`: input structure probes.
+- `summary.py`: Polars/Rich summaries.
+- `jsonl.py`: JSONL helpers.
 
-```sh
-nvidia-smi
-```
+Candidate pipeline:
 
-Flox package names verified from package metadata:
+- `render.py`: renders CUDA artifacts and a render manifest.
+- `compile_plan.py`: converts render rows into `nvcc` jobs. The CLI exposes `--gpu-arch`, defaulting to `sm_89` for L4.
+- `compile.py`: executes compile jobs, writes `.so` files and compile-result manifests.
+- `run_plan.py`: converts compile rows into run jobs.
+- `run.py`: loads compiled shared objects with `ctypes`, launches kernels, checks `(H, tau)`, and writes run-result manifests.
+- `cli.py`: exposes `baseline`, `probe`, `summary`, `render`, `verify-renders`, `plan-compile`, `verify-compile-plan`, `compile-one`, `compile`, `verify-compile-results`, `plan-run`, `verify-run-plan`, `run-one`, `run`, and `verify-run-results`.
 
-```sh
-flox install -d . \
-  -i cuda_nvcc cudaPackages.cuda_nvcc@12.9.86 \
-  -i cuda_cudart cudaPackages.cuda_cudart@12.9.79 \
-  -i cuda_cccl cudaPackages.cuda_cccl@12.9.27 \
-  -i gcc gcc13@13.4.0
-```
+Current render candidates:
 
-Then reactivate and check:
+- `serial` (default): `qr_v2_geqr2_serial_tpb128_tile32`, template `cuda_geqr2_serial_v1`. Correct-first GEQR2 baseline, one block per matrix, one active thread.
+- `parallel`: `qr_v2_geqr2_parallel_tpb256_tile32`, template `cuda_geqr2_parallel_v1`. One block per matrix, cooperative reductions for column norms and reflector dot products, parallel trailing-column updates.
 
-```sh
-flox activate -d .
-nvcc --version
-nvcc --list-gpu-arch | grep compute_89
-gcc --version
-```
+Rendering a suite writes `data/qr_v2/renders/<suite>/manifest.jsonl`. That manifest points at the most recently rendered candidate for that suite, while artifacts live under candidate-specific subdirectories.
 
-For L4, target `sm_89`. Do not use the B200/Blackwell `sm_100` notes from `docs/plan.md` for this L4 phase.
+## Standard Pipeline
 
-Optional later tooling:
-
-```sh
-flox install -d . \
-  -i cuda_cuobjdump cudaPackages.cuda_cuobjdump@12.9.82 \
-  -i cuda_nvdisasm cudaPackages.cuda_nvdisasm@12.9.88 \
-  -i binutils binutils
-```
-
-Defer profiler/tooling packages until compile/run works.
-
-## Immediate L4 Commands
-
-From the L4 repo:
+Use this from the repo root:
 
 ```sh
-cd /teamspace/studios/this_studio/gpumode
-flox activate -d .
-
-python --version
-uv --version
-uv sync --python "$FLOX_ENV/bin/python"
-
-uv run qr-v2 verify-renders --suite smoke
-uv run qr-v2 verify-compile-plan --suite smoke
-uv run qr-v2 verify-run-plan --suite smoke
+flox activate -- uv run qr-v2 render --suite tests --limit 3 --candidate parallel
+flox activate -- uv run qr-v2 verify-renders --suite tests
+flox activate -- uv run qr-v2 plan-compile --suite tests
+flox activate -- uv run qr-v2 verify-compile-plan --suite tests
+flox activate -- uv run qr-v2 compile --suite tests --timeout-seconds 60
+flox activate -- uv run qr-v2 verify-compile-results --suite tests
+flox activate -- uv run qr-v2 plan-run --suite tests
+flox activate -- uv run qr-v2 verify-run-plan --suite tests
+flox activate -- uv run qr-v2 run --suite tests --limit 3
+flox activate -- uv run qr-v2 verify-run-results --suite tests
 ```
 
-If uv still does not pick the right interpreter, try:
+For result summaries, `yq` is available in Flox. `jq` is not installed.
+
+## Latest L4 Results
+
+Host used for setup: NVIDIA L4, driver 580.159.03, CUDA 13.0, target arch `sm_89`.
+
+Serial baseline passed the first three official `tests` cases:
+
+```text
+n=32,  batch=20: passed, ~158 ms
+n=176, batch=40: passed, ~300 ms
+n=352, batch=40: passed, ~2839 ms
+```
+
+Parallel candidate passed all 10 smoke cases and the first three official `tests` cases:
+
+```text
+n=32,  batch=20: passed, 137.436 ms
+n=176, batch=40: passed, 48.382 ms
+n=352, batch=40: passed, 240.441 ms
+```
+
+The parallel candidate is already the better platform for larger early cases. L4 has served its purpose for environment setup and initial correctness gating.
+
+Final checks passed after the parallel candidate work:
 
 ```sh
-UV_PYTHON="$FLOX_ENV/bin/python" uv sync
-UV_PYTHON="$FLOX_ENV/bin/python" uv run python --version
+flox activate -- uv run ruff check .
+flox activate -- uv run ty check
+flox activate -- uv sync
+flox activate -- git diff --check
 ```
 
-## Next Implementation Step
+## Alignment With Proposal And Plan
 
-Add `qr-v2 compile-one`.
+`docs/proposal.md` and `docs/plan.md` describe the larger strategy: build a semantic work-reduction tournament, not just a faster fixed QR kernel. The current repo is aligned with the early infrastructure part of that plan: it has deterministic input generation, a local checker, candidate rendering, compile/run manifests, correctness result records, and a first native CUDA candidate. It is not yet aligned with the later tournament architecture: there is no PyTorch extension API, no cuSOLVER/cuSolverDx fallback, no candidate registry, no semantic feasibility table, and no frozen dispatch system.
 
-Suggested behavior:
+Treat the current parallel GEQR2 kernel as a correctness and profiling foothold. Do not let it become the whole strategy unless the semantic probes show no useful slack.
+
+## Next Steps
+
+Move to the H100 next. Save the B200 until after the H100 pass answers two questions: whether the current CUDA path is portable/timing-sane on a stronger GPU, and which semantic work-reduction probes deserve implementation before a real B200 tournament.
+
+On H100, use `qr-v2 plan-compile --gpu-arch sm_90`. For B200 later, confirm the supported Blackwell target with `nvcc --list-gpu-arch` on that machine before planning compiles.
+
+Then rerun the first-three test gate on H100 with the parallel candidate:
 
 ```sh
-uv run qr-v2 compile-one --suite smoke --index 0
+flox activate -- uv run qr-v2 render --suite tests --limit 3 --candidate parallel
+flox activate -- uv run qr-v2 plan-compile --suite tests --gpu-arch sm_90
+flox activate -- uv run qr-v2 compile --suite tests --timeout-seconds 60
+flox activate -- uv run qr-v2 plan-run --suite tests
+flox activate -- uv run qr-v2 run --suite tests --limit 3
+flox activate -- uv run qr-v2 verify-run-results --suite tests
 ```
 
-It should:
+If that passes, profile `n=176` and `n=352` with Nsight Compute. Look first at time spent in reductions, reflector dot products, and trailing updates.
 
-- Read exactly one row from `data/qr_v2/compile-plans/<suite>/manifest.jsonl`.
-- Run that row's `compile_argv`.
-- Ensure output paths stay under `data/qr_v2/`.
-- Create parent directories for the planned `.so`.
-- Measure duration.
-- Capture return code.
-- Capture bounded stdout/stderr snippets.
-- Record `nvcc --version`.
-- On success, record output `.so` bytes and SHA256.
-- Write a compile result JSONL record under `data/qr_v2/compile-results/<suite>/...`.
+After the H100 gate, return to the proposal/plan priorities before spending B200 time:
 
-Keep the failure path useful on any machine:
+- Add semantic feasibility probes and summary output for early-stop rate, approximate-upper shortcut rate, column-scale span, zero-tail reflector frequency, and routing/compaction overhead.
+- Build a small baseline portfolio: current serial/parallel kernels plus a vendor fallback path if cuSOLVER/cuSolverDx is available in the environment.
+- Start recording result fields needed by the tournament plan, especially `candidate_id`, runtime, residual diagnostics, fallback count, and stop panel.
+- Use those data to decide whether to implement early stop, upper-triangular shortcut, power-of-two gauge, speculative fast path, or a bigger tiled/multi-block QR core first.
 
-- Missing compile plan should emit a JSONL-style error and return nonzero.
-- Missing `nvcc` should emit a compile result record with nonzero status.
-- A failed compile should preserve stderr in the result record.
+Likely implementation paths:
 
-After `compile-one` works:
-
-1. Add a compile-result verifier.
-2. Add `qr-v2 run-one` that consumes one run-plan row and one compiled `.so`.
-3. Write run/check result JSONL under `data/qr_v2/run-results/<suite>/...`.
-4. Only then start replacing the CUDA stub body with the real QR kernel.
+- If semantic probes show slack, implement the highest-yield semantic operator first; proposal priority is early stop, then structural shortcut, gauge/speculative fast path, and per-matrix routing.
+- If semantic probes show little slack on the relevant cases, focus on backend work: tiled or multi-block QR for `n>=512`, vendor baselines, and eventually cuBLASLt/CUTLASS-style updates.
+- Always keep `passed` as the gate; compare residual diagnostics against the serial candidate when changing math order.
 
 ## Gotchas
 
-- `from __future__ import annotations` was removed because we are on Python 3.13 and were not relying on it.
-- The CLI uses `argparse` plus `rich`; Typer is not installed.
-- `structlog` and `msgspec` were discussed and intentionally not added.
-- `pytest` was discussed and intentionally not added yet.
-- Use JSONL plus Polars for data, not extra Python data dependencies.
-- Keep all generated data under `./data/`.
-- Keep project tooling local to uv/Flox; do not install Lightning or Python packages globally.
+- The worktree is intentionally dirty during this session; do not reset unrelated changes.
+- `plan-compile` defaults to `sm_89`; pass `--gpu-arch sm_90` on H100.
+- No `pytest` dependency has been added yet; verification is CLI/manifests/JSONL-first.
+- Keep generated artifacts under `data/qr_v2/`.
+- Keep dependencies local to Flox/uv. Do not globally install Python packages or CUDA tools.

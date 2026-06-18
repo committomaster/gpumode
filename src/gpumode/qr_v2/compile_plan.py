@@ -89,9 +89,10 @@ def _compile_output_path(*, suite: str, candidate_id: str, artifact_path: str, o
     return output_root / suite / candidate_id / stem
 
 
-def _compile_argv(*, artifact_path: str, output_path: Path) -> list[str]:
+def _compile_argv(*, artifact_path: str, output_path: Path, gpu_arch: str) -> list[str]:
     return [
         "nvcc",
+        f"-arch={gpu_arch}",
         "--shared",
         "-Xcompiler",
         "-fPIC",
@@ -114,6 +115,7 @@ def plan_compile_from_render_manifest(
     out_dir: Path,
     output_root: Path,
     target_backend: str = "cuda",
+    gpu_arch: str = "sm_89",
 ) -> CompilePlanResult:
     render_records = _read_jsonl_objects(render_manifest_path)
     records: list[dict[str, object]] = []
@@ -137,10 +139,12 @@ def plan_compile_from_render_manifest(
                 "target_backend": target_backend,
                 "compiler": "nvcc",
                 "compiler_family": "cuda",
+                "gpu_arch": gpu_arch,
                 "compile_cwd": ".",
                 "compile_argv": _compile_argv(
                     artifact_path=artifact_path,
                     output_path=output_path,
+                    gpu_arch=gpu_arch,
                 ),
                 "output_kind": "cuda_shared_object",
                 "output_path": output_path.as_posix(),

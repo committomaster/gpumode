@@ -9,6 +9,13 @@ from rich.console import Console
 from rich.table import Table
 
 from gpumode.qr_v2.baseline import get_spec_suite, run_torch_geqrf_baseline
+from gpumode.qr_v2.compile import (
+    CompileExecutionResult,
+    CompileResultVerificationResult,
+    compile_from_plan_manifest,
+    compile_one_from_plan_manifest,
+    verify_compile_result_manifest,
+)
 from gpumode.qr_v2.compile_plan import (
     CompilePlanResult,
     CompilePlanVerificationResult,
@@ -17,7 +24,15 @@ from gpumode.qr_v2.compile_plan import (
 )
 from gpumode.qr_v2.jsonl import append_jsonl, dumps_record, write_jsonl
 from gpumode.qr_v2.probes import run_structure_probe
-from gpumode.qr_v2.render import RenderSuiteResult, RenderVerificationResult, render_suite, verify_render_manifest
+from gpumode.qr_v2.render import KERNEL_CONFIGS, RenderSuiteResult, RenderVerificationResult, render_suite, verify_render_manifest
+from gpumode.qr_v2.run import (
+    RunExecutionResult,
+    RunResultVerificationResult,
+    run_from_plan_manifest,
+    run_one,
+    run_one_from_plan_manifest,
+    verify_run_result_manifest,
+)
 from gpumode.qr_v2.run_plan import (
     RunPlanResult,
     RunPlanVerificationResult,
@@ -112,6 +127,7 @@ def _run_render(args: argparse.Namespace) -> int:
         suite=args.suite,
         specs=specs,
         out_dir=_data_directory_path(args.out, suite=args.suite, kind="renders"),
+        config=KERNEL_CONFIGS[args.candidate],
     )
 
     if args.stdout:
@@ -181,6 +197,7 @@ def _compile_plan_report(result: CompilePlanResult) -> None:
         if plan_count:
             print(f"backend: {result.records[0]['target_backend']}")
             print(f"compiler: {result.records[0]['compiler']}")
+            print(f"gpu_arch: {result.records[0]['gpu_arch']}")
         return
 
     table = Table(title="compile plan", show_header=False)
@@ -191,6 +208,7 @@ def _compile_plan_report(result: CompilePlanResult) -> None:
     if plan_count:
         table.add_row("backend", str(result.records[0]["target_backend"]))
         table.add_row("compiler", str(result.records[0]["compiler"]))
+        table.add_row("gpu_arch", str(result.records[0]["gpu_arch"]))
     Console().print(table)
 
 
@@ -213,6 +231,7 @@ def _run_plan_compile(args: argparse.Namespace) -> int:
         render_manifest_path=render_manifest_path,
         out_dir=_data_directory_path(args.out, suite=args.suite, kind="compile-plans"),
         output_root=DATA_DIR / "qr_v2" / "compiled",
+        gpu_arch=args.gpu_arch,
     )
     if args.stdout:
         for record in result.records:
@@ -272,6 +291,293 @@ def _run_verify_compile_plan(args: argparse.Namespace) -> int:
             print(dumps_record(issue.to_record()))
     else:
         _verify_compile_plan_report(result)
+    return 0 if result.ok else 1
+
+
+def _compile_result_report(result: CompileExecutionResult) -> None:
+    result_count = len(result.records)
+    ok_count = sum(1 for record in result.records if bool(record.get("ok")))
+    failed_count = result_count - ok_count
+    if not sys.stdout.isatty():
+        print(f"compiled {ok_count}/{result_count} jobs")
+        print(f"manifest: {result.manifest_path}")
+        print(f"failed: {failed_count}")
+        if result_count == 1:
+            record = result.records[0]
+            print(f"status: {record.get('status', '')}")
+            if record.get("output_path"):
+                print(f"output: {record['output_path']}")
+        return
+
+    table = Table(title="compile", show_header=False)
+    table.add_column("field", style="bold")
+    table.add_column("value")
+    table.add_row("status", "[green]pass[/green]" if result.ok else "[bold red]fail[/bold red]")
+    table.add_row("manifest", result.manifest_path.as_posix())
+    table.add_row("jobs", str(result_count))
+    table.add_row("passed", str(ok_count))
+    table.add_row("failed", str(failed_count))
+    if result_count == 1:
+        record = result.records[0]
+        table.add_row("result", str(record.get("status", "")))
+        if record.get("output_path"):
+            table.add_row("output", str(record["output_path"]))
+    Console().print(table)
+
+
+def _run_compile_one(args: argparse.Namespace) -> int:
+    compile_plan_path = _data_directory_path(None, suite=args.suite, kind="compile-plans") / "manifest.jsonl"
+    if args.compile_plan is not None:
+        compile_plan_path = _data_output_path(args.compile_plan, suite=args.suite, kind="compile-plans")
+
+    result = compile_one_from_plan_manifest(
+        suite=args.suite,
+        compile_plan_manifest_path=compile_plan_path,
+        index=args.index,
+        out_dir=_data_directory_path(args.out, suite=args.suite, kind="compile-results"),
+        timeout_seconds=args.timeout_seconds,
+        max_snippet_chars=args.max_snippet_chars,
+    )
+    if args.stdout:
+        for record in result.records:
+            print(dumps_record(record))
+    else:
+        _compile_result_report(result)
+    return 0 if result.ok else 1
+
+
+def _run_compile(args: argparse.Namespace) -> int:
+    compile_plan_path = _data_directory_path(None, suite=args.suite, kind="compile-plans") / "manifest.jsonl"
+    if args.compile_plan is not None:
+        compile_plan_path = _data_output_path(args.compile_plan, suite=args.suite, kind="compile-plans")
+
+    result = compile_from_plan_manifest(
+        suite=args.suite,
+        compile_plan_manifest_path=compile_plan_path,
+        out_dir=_data_directory_path(args.out, suite=args.suite, kind="compile-results"),
+        limit=args.limit,
+        timeout_seconds=args.timeout_seconds,
+        max_snippet_chars=args.max_snippet_chars,
+    )
+    if args.stdout:
+        for record in result.records:
+            print(dumps_record(record))
+    else:
+        _compile_result_report(result)
+    return 0 if result.ok else 1
+
+
+def _verify_compile_result_report(result: CompileResultVerificationResult) -> None:
+    if not sys.stdout.isatty():
+        print("compile results ok" if result.ok else "compile results failed")
+        print(f"manifest: {result.manifest_path}")
+        print(f"records: {result.records_checked}")
+        print(f"outputs: {result.outputs_checked}")
+        print(f"logs: {result.logs_checked}")
+        print(f"issues: {len(result.issues)}")
+        for issue in result.issues:
+            print(dumps_record(issue.to_record()))
+        return
+
+    table = Table(title="verify-compile-results", show_header=False)
+    table.add_column("field", style="bold")
+    table.add_column("value")
+    table.add_row("status", "[green]pass[/green]" if result.ok else "[bold red]fail[/bold red]")
+    table.add_row("manifest", result.manifest_path.as_posix())
+    table.add_row("records", str(result.records_checked))
+    table.add_row("outputs", str(result.outputs_checked))
+    table.add_row("logs", str(result.logs_checked))
+    table.add_row("issues", str(len(result.issues)))
+    Console().print(table)
+
+    if result.issues:
+        issues = Table(title="compile result issues")
+        issues.add_column("code", style="bold red")
+        issues.add_column("line", justify="right")
+        issues.add_column("output")
+        issues.add_column("message")
+        for issue in result.issues:
+            issues.add_row(
+                issue.code,
+                "" if issue.line_number is None else str(issue.line_number),
+                issue.output_path or "",
+                issue.message,
+            )
+        Console().print(issues)
+
+
+def _run_verify_compile_results(args: argparse.Namespace) -> int:
+    manifest_path = _data_directory_path(None, suite=args.suite, kind="compile-results") / "manifest.jsonl"
+    if args.manifest is not None:
+        manifest_path = _data_output_path(args.manifest, suite=args.suite, kind="compile-results")
+
+    result = verify_compile_result_manifest(manifest_path)
+    if args.stdout:
+        for issue in result.issues:
+            print(dumps_record(issue.to_record()))
+    else:
+        _verify_compile_result_report(result)
+    return 0 if result.ok else 1
+
+
+def _run_result_report(result: RunExecutionResult) -> None:
+    result_count = len(result.records)
+    ok_count = sum(1 for record in result.records if bool(record.get("ok")))
+    failed_count = result_count - ok_count
+    if not sys.stdout.isatty():
+        print(f"ran {ok_count}/{result_count} jobs")
+        print(f"manifest: {result.result_path}")
+        print(f"failed: {failed_count}")
+        if result_count == 1:
+            record = result.records[0]
+            print(f"status: {record.get('status', '')}")
+            print(f"passed: {record.get('passed', False)}")
+            if record.get("run_result_path"):
+                print(f"result: {record['run_result_path']}")
+        return
+
+    table = Table(title="run", show_header=False)
+    table.add_column("field", style="bold")
+    table.add_column("value")
+    table.add_row("status", "[green]pass[/green]" if result.ok else "[bold red]fail[/bold red]")
+    table.add_row("manifest", result.result_path.as_posix())
+    table.add_row("jobs", str(result_count))
+    table.add_row("completed", str(ok_count))
+    table.add_row("failed", str(failed_count))
+    if result_count == 1:
+        record = result.records[0]
+        table.add_row("result", str(record.get("status", "")))
+        table.add_row("passed", str(record.get("passed", False)))
+        if record.get("run_result_path"):
+            table.add_row("output", str(record["run_result_path"]))
+    Console().print(table)
+
+
+def _run_run_one(args: argparse.Namespace) -> int:
+    result_path = None if args.out is None else _data_output_path(args.out, suite=args.suite, kind="run-results")
+
+    if args.compiled_artifact is not None:
+        missing = [
+            name
+            for name in ("entry_point", "batch", "n", "cond", "seed", "case")
+            if getattr(args, name) is None
+        ]
+        if missing:
+            print(f"missing direct run-one args: {', '.join('--' + name.replace('_', '-') for name in missing)}", file=sys.stderr)
+            return 2
+        assert args.entry_point is not None
+        assert args.batch is not None
+        assert args.n is not None
+        assert args.cond is not None
+        assert args.seed is not None
+        assert args.case is not None
+        result = run_one(
+            suite=args.suite,
+            compiled_artifact_path=Path(args.compiled_artifact),
+            entry_point=args.entry_point,
+            launcher_entry_point=args.launcher_entry_point,
+            batch=args.batch,
+            n=args.n,
+            cond=args.cond,
+            seed=args.seed,
+            case=args.case,
+            threads_per_block=args.threads_per_block,
+            result_path=result_path,
+            device=args.device,
+            max_snippet_chars=args.max_snippet_chars,
+        )
+    else:
+        run_plan_path = _data_directory_path(None, suite=args.suite, kind="run-plans") / "manifest.jsonl"
+        if args.run_plan is not None:
+            run_plan_path = _data_output_path(args.run_plan, suite=args.suite, kind="run-plans")
+        result = run_one_from_plan_manifest(
+            suite=args.suite,
+            run_plan_manifest_path=run_plan_path,
+            index=args.index,
+            result_path=result_path,
+            device=args.device,
+            max_snippet_chars=args.max_snippet_chars,
+        )
+
+    if args.stdout:
+        for record in result.records:
+            print(dumps_record(record))
+    else:
+        _run_result_report(result)
+    return 0 if result.ok else 1
+
+
+def _run_run(args: argparse.Namespace) -> int:
+    run_plan_path = _data_directory_path(None, suite=args.suite, kind="run-plans") / "manifest.jsonl"
+    if args.run_plan is not None:
+        run_plan_path = _data_output_path(args.run_plan, suite=args.suite, kind="run-plans")
+
+    result = run_from_plan_manifest(
+        suite=args.suite,
+        run_plan_manifest_path=run_plan_path,
+        out_dir=_data_directory_path(args.out, suite=args.suite, kind="run-results"),
+        limit=args.limit,
+        device=args.device,
+        max_snippet_chars=args.max_snippet_chars,
+    )
+    if args.stdout:
+        for record in result.records:
+            print(dumps_record(record))
+    else:
+        _run_result_report(result)
+    return 0 if result.ok else 1
+
+
+def _verify_run_result_report(result: RunResultVerificationResult) -> None:
+    if not sys.stdout.isatty():
+        print("run results ok" if result.ok else "run results failed")
+        print(f"manifest: {result.manifest_path}")
+        print(f"records: {result.records_checked}")
+        print(f"result_files: {result.result_files_checked}")
+        print(f"artifacts: {result.artifacts_checked}")
+        print(f"issues: {len(result.issues)}")
+        for issue in result.issues:
+            print(dumps_record(issue.to_record()))
+        return
+
+    table = Table(title="verify-run-results", show_header=False)
+    table.add_column("field", style="bold")
+    table.add_column("value")
+    table.add_row("status", "[green]pass[/green]" if result.ok else "[bold red]fail[/bold red]")
+    table.add_row("manifest", result.manifest_path.as_posix())
+    table.add_row("records", str(result.records_checked))
+    table.add_row("result files", str(result.result_files_checked))
+    table.add_row("artifacts", str(result.artifacts_checked))
+    table.add_row("issues", str(len(result.issues)))
+    Console().print(table)
+
+    if result.issues:
+        issues = Table(title="run result issues")
+        issues.add_column("code", style="bold red")
+        issues.add_column("line", justify="right")
+        issues.add_column("result")
+        issues.add_column("message")
+        for issue in result.issues:
+            issues.add_row(
+                issue.code,
+                "" if issue.line_number is None else str(issue.line_number),
+                issue.run_result_path or "",
+                issue.message,
+            )
+        Console().print(issues)
+
+
+def _run_verify_run_results(args: argparse.Namespace) -> int:
+    manifest_path = _data_directory_path(None, suite=args.suite, kind="run-results") / "manifest.jsonl"
+    if args.manifest is not None:
+        manifest_path = _data_output_path(args.manifest, suite=args.suite, kind="run-results")
+
+    result = verify_run_result_manifest(manifest_path)
+    if args.stdout:
+        for issue in result.issues:
+            print(dumps_record(issue.to_record()))
+    else:
+        _verify_run_result_report(result)
     return 0 if result.ok else 1
 
 
@@ -438,6 +744,7 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--stdout", action="store_true")
     render.add_argument("--limit", type=int, default=None)
     render.add_argument("--max-n", type=int, default=None)
+    render.add_argument("--candidate", choices=tuple(KERNEL_CONFIGS), default="serial")
     render.set_defaults(func=_run_render)
 
     verify_renders = subparsers.add_parser("verify-renders", help="verify rendered qr_v2 artifact manifests")
@@ -451,6 +758,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan_compile.add_argument("--render-manifest", default=None)
     plan_compile.add_argument("--out", default=None)
     plan_compile.add_argument("--stdout", action="store_true")
+    plan_compile.add_argument("--gpu-arch", default="sm_89")
     plan_compile.set_defaults(func=_run_plan_compile)
 
     verify_compile_plan = subparsers.add_parser("verify-compile-plan", help="verify qr_v2 compile-plan manifests")
@@ -458,6 +766,73 @@ def build_parser() -> argparse.ArgumentParser:
     verify_compile_plan.add_argument("--manifest", default=None)
     verify_compile_plan.add_argument("--stdout", action="store_true")
     verify_compile_plan.set_defaults(func=_run_verify_compile_plan)
+
+    compile_one = subparsers.add_parser("compile-one", help="compile one qr_v2 compile-plan row")
+    compile_one.add_argument("--suite", choices=("smoke", "tests", "benchmarks"), default="smoke")
+    compile_one.add_argument("--compile-plan", default=None)
+    compile_one.add_argument("--index", type=int, default=0)
+    compile_one.add_argument("--out", default=None)
+    compile_one.add_argument("--stdout", action="store_true")
+    compile_one.add_argument("--timeout-seconds", type=float, default=None)
+    compile_one.add_argument("--max-snippet-chars", type=int, default=4000)
+    compile_one.set_defaults(func=_run_compile_one)
+
+    compile_cmd = subparsers.add_parser("compile", help="compile qr_v2 compile-plan rows")
+    compile_cmd.add_argument("--suite", choices=("smoke", "tests", "benchmarks"), default="smoke")
+    compile_cmd.add_argument("--compile-plan", default=None)
+    compile_cmd.add_argument("--out", default=None)
+    compile_cmd.add_argument("--stdout", action="store_true")
+    compile_cmd.add_argument("--limit", type=int, default=None)
+    compile_cmd.add_argument("--timeout-seconds", type=float, default=None)
+    compile_cmd.add_argument("--max-snippet-chars", type=int, default=4000)
+    compile_cmd.set_defaults(func=_run_compile)
+
+    verify_compile_results = subparsers.add_parser(
+        "verify-compile-results",
+        help="verify qr_v2 compile-result manifests",
+    )
+    verify_compile_results.add_argument("--suite", choices=("smoke", "tests", "benchmarks"), default="smoke")
+    verify_compile_results.add_argument("--manifest", default=None)
+    verify_compile_results.add_argument("--stdout", action="store_true")
+    verify_compile_results.set_defaults(func=_run_verify_compile_results)
+
+    run_one_cmd = subparsers.add_parser("run-one", help="run one qr_v2 run-plan row or compiled artifact")
+    run_one_cmd.add_argument("--suite", choices=("smoke", "tests", "benchmarks"), default="smoke")
+    run_one_cmd.add_argument("--run-plan", default=None)
+    run_one_cmd.add_argument("--index", type=int, default=0)
+    run_one_cmd.add_argument("--compiled-artifact", default=None)
+    run_one_cmd.add_argument("--entry-point", default=None)
+    run_one_cmd.add_argument("--launcher-entry-point", default=None)
+    run_one_cmd.add_argument("--batch", type=int, default=None)
+    run_one_cmd.add_argument("--n", type=int, default=None)
+    run_one_cmd.add_argument("--cond", type=int, default=None)
+    run_one_cmd.add_argument("--seed", type=int, default=None)
+    run_one_cmd.add_argument("--case", default=None)
+    run_one_cmd.add_argument("--threads-per-block", type=int, default=128)
+    run_one_cmd.add_argument("--device", default=None)
+    run_one_cmd.add_argument("--out", default=None)
+    run_one_cmd.add_argument("--stdout", action="store_true")
+    run_one_cmd.add_argument("--max-snippet-chars", type=int, default=4000)
+    run_one_cmd.set_defaults(func=_run_run_one)
+
+    run_cmd = subparsers.add_parser("run", help="run qr_v2 run-plan rows")
+    run_cmd.add_argument("--suite", choices=("smoke", "tests", "benchmarks"), default="smoke")
+    run_cmd.add_argument("--run-plan", default=None)
+    run_cmd.add_argument("--out", default=None)
+    run_cmd.add_argument("--stdout", action="store_true")
+    run_cmd.add_argument("--limit", type=int, default=None)
+    run_cmd.add_argument("--device", default=None)
+    run_cmd.add_argument("--max-snippet-chars", type=int, default=4000)
+    run_cmd.set_defaults(func=_run_run)
+
+    verify_run_results = subparsers.add_parser(
+        "verify-run-results",
+        help="verify qr_v2 run-result manifests",
+    )
+    verify_run_results.add_argument("--suite", choices=("smoke", "tests", "benchmarks"), default="smoke")
+    verify_run_results.add_argument("--manifest", default=None)
+    verify_run_results.add_argument("--stdout", action="store_true")
+    verify_run_results.set_defaults(func=_run_verify_run_results)
 
     plan_run = subparsers.add_parser("plan-run", help="plan future run jobs from compile plans")
     plan_run.add_argument("--suite", choices=("smoke", "tests", "benchmarks"), default="smoke")
