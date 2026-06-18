@@ -18,6 +18,25 @@ from gpumode.qr_v2.jsonl import write_jsonl
 RUN_RESULT_VERSION = "run_result_v1"
 DEFAULT_SNIPPET_CHARS = 4000
 DEFAULT_THREADS_PER_BLOCK = 128
+PROFILE_TEMPLATE_ID = "cuda_geqr2_parallel_profile_v1"
+PROFILE_COUNTER_FIELDS = (
+    "total_cycles",
+    "init_cycles",
+    "norm_cycles",
+    "scale_cycles",
+    "dot_cycles",
+    "update_cycles",
+    "active_reflectors",
+    "inactive_reflectors",
+    "trailing_columns",
+)
+PROFILE_PHASE_FIELDS = (
+    "init_cycles",
+    "norm_cycles",
+    "scale_cycles",
+    "dot_cycles",
+    "update_cycles",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +137,68 @@ def _bounded_text(text: str, *, max_chars: int) -> str:
 def _tensor_sha256(tensor: torch.Tensor) -> str:
     content = tensor.detach().cpu().contiguous().numpy().tobytes()
     return _sha256_bytes(content)
+
+
+def _uses_device_profile(plan_record: dict[str, Any] | None, launcher_entry_point: str | None) -> bool:
+    if launcher_entry_point is not None and launcher_entry_point.endswith("_launch_profile"):
+        return True
+    if plan_record is None:
+        return False
+    return plan_record.get("template_id") == PROFILE_TEMPLATE_ID
+
+
+def _profile_cycle_summary(profile: torch.Tensor) -> dict[str, object]:
+    cpu_profile = profile.detach().cpu().contiguous()
+    rows = [[int(value) for value in row] for row in cpu_profile.tolist()]
+    if not rows:
+        return {
+            "profile_source": "device_clock64",
+            "profile_field_names": list(PROFILE_COUNTER_FIELDS),
+            "profile_block_count": 0,
+            "profile_sha256": _tensor_sha256(cpu_profile),
+            "profile_cycles_sum": {field: 0 for field in PROFILE_COUNTER_FIELDS},
+            "profile_cycles_mean": {field: 0.0 for field in PROFILE_COUNTER_FIELDS},
+            "profile_cycles_max": {field: 0 for field in PROFILE_COUNTER_FIELDS},
+            "profile_cycles_min": {field: 0 for field in PROFILE_COUNTER_FIELDS},
+            "profile_measured_phase_cycles_sum": 0,
+            "profile_phase_cycle_percent": {field: 0.0 for field in PROFILE_PHASE_FIELDS},
+            "profile_worst_matrix": -1,
+            "profile_worst_matrix_cycles": {field: 0 for field in PROFILE_COUNTER_FIELDS},
+        }
+
+    columns = list(zip(*rows, strict=True))
+    sums = [sum(column) for column in columns]
+    means = [sum(column) / len(column) for column in columns]
+    maxima = [max(column) for column in columns]
+    minima = [min(column) for column in columns]
+    worst_matrix = max(range(len(rows)), key=lambda index: rows[index][0])
+
+    cycle_sum = {field: sums[index] for index, field in enumerate(PROFILE_COUNTER_FIELDS)}
+    cycle_mean = {field: means[index] for index, field in enumerate(PROFILE_COUNTER_FIELDS)}
+    cycle_max = {field: maxima[index] for index, field in enumerate(PROFILE_COUNTER_FIELDS)}
+    cycle_min = {field: minima[index] for index, field in enumerate(PROFILE_COUNTER_FIELDS)}
+    worst_cycles = {field: rows[worst_matrix][index] for index, field in enumerate(PROFILE_COUNTER_FIELDS)}
+
+    measured_phase_sum = sum(cycle_sum[field] for field in PROFILE_PHASE_FIELDS)
+    if measured_phase_sum > 0:
+        phase_percent = {field: 100.0 * cycle_sum[field] / measured_phase_sum for field in PROFILE_PHASE_FIELDS}
+    else:
+        phase_percent = {field: 0.0 for field in PROFILE_PHASE_FIELDS}
+
+    return {
+        "profile_source": "device_clock64",
+        "profile_field_names": list(PROFILE_COUNTER_FIELDS),
+        "profile_block_count": len(rows),
+        "profile_sha256": _tensor_sha256(cpu_profile),
+        "profile_cycles_sum": cycle_sum,
+        "profile_cycles_mean": cycle_mean,
+        "profile_cycles_max": cycle_max,
+        "profile_cycles_min": cycle_min,
+        "profile_measured_phase_cycles_sum": int(measured_phase_sum),
+        "profile_phase_cycle_percent": phase_percent,
+        "profile_worst_matrix": worst_matrix,
+        "profile_worst_matrix_cycles": worst_cycles,
+    }
 
 
 def _cuda_device_index(device: str | None) -> int:
@@ -282,7 +363,10 @@ def _run_kernel_record(
     _check_execution_path(compiled_artifact_path, field="compiled_artifact_path", prefix=("data", "qr_v2", "compiled"))
     _check_execution_path(result_path.as_posix(), field="run_result_path", prefix=("data", "qr_v2", "run-results"))
 
-    launcher_name = launcher_entry_point or f"{entry_point}_launch"
+    collect_device_profile = _uses_device_profile(plan_record, launcher_entry_point)
+    launcher_name = launcher_entry_point or (
+        f"{entry_point}_launch_profile" if collect_device_profile else f"{entry_point}_launch"
+    )
     record = _base_record(
         suite=suite,
         plan_record=plan_record,
@@ -350,25 +434,56 @@ def _run_kernel_record(
             )
             return record
 
-        launcher.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-        ]
-        launcher.restype = ctypes.c_int
-        returncode = int(
-            launcher(
-                ctypes.c_void_p(a.data_ptr()),
-                ctypes.c_void_p(h.data_ptr()),
-                ctypes.c_void_p(tau.data_ptr()),
-                ctypes.c_int(batch),
-                ctypes.c_int(n),
-                ctypes.c_int(threads_per_block),
+        profile = None
+        if collect_device_profile:
+            profile = torch.zeros(
+                (batch, len(PROFILE_COUNTER_FIELDS)),
+                device=resolved_device,
+                dtype=torch.uint64,
             )
-        )
+            launcher.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            launcher.restype = ctypes.c_int
+            returncode = int(
+                launcher(
+                    ctypes.c_void_p(a.data_ptr()),
+                    ctypes.c_void_p(h.data_ptr()),
+                    ctypes.c_void_p(tau.data_ptr()),
+                    ctypes.c_void_p(profile.data_ptr()),
+                    ctypes.c_int(batch),
+                    ctypes.c_int(n),
+                    ctypes.c_int(threads_per_block),
+                    ctypes.c_int(len(PROFILE_COUNTER_FIELDS)),
+                )
+            )
+        else:
+            launcher.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            launcher.restype = ctypes.c_int
+            returncode = int(
+                launcher(
+                    ctypes.c_void_p(a.data_ptr()),
+                    ctypes.c_void_p(h.data_ptr()),
+                    ctypes.c_void_p(tau.data_ptr()),
+                    ctypes.c_int(batch),
+                    ctypes.c_int(n),
+                    ctypes.c_int(threads_per_block),
+                )
+            )
         elapsed_ns = time.perf_counter_ns() - start_ns
         record.update(
             {
@@ -379,6 +494,8 @@ def _run_kernel_record(
                 "output_tau_sha256": _tensor_sha256(tau),
             }
         )
+        if returncode == 0 and profile is not None:
+            record.update(_profile_cycle_summary(profile))
         if returncode != 0:
             record.update(
                 {

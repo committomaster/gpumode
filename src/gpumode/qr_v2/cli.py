@@ -98,7 +98,15 @@ def _run_baseline(args: argparse.Namespace) -> int:
 
 def _run_probe(args: argparse.Namespace) -> int:
     specs = _filtered_specs(get_spec_suite(args.suite), limit=args.limit, max_n=args.max_n)
-    records = [run_structure_probe(spec, device=args.device) for spec in specs]
+    records = [
+        run_structure_probe(
+            spec,
+            device=args.device,
+            early_stop_max_n=args.early_stop_max_n,
+            rank_probe_max_n=args.rank_probe_max_n,
+        )
+        for spec in specs
+    ]
     _write_records(args, records, kind="probes")
     return 0
 
@@ -736,6 +744,8 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--append", action="store_true")
     probe.add_argument("--limit", type=int, default=None)
     probe.add_argument("--max-n", type=int, default=None)
+    probe.add_argument("--early-stop-max-n", type=int, default=512)
+    probe.add_argument("--rank-probe-max-n", type=int, default=512)
     probe.set_defaults(func=_run_probe)
 
     render = subparsers.add_parser("render", help="render deterministic qr_v2 candidate artifacts")

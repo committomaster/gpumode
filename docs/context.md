@@ -65,6 +65,10 @@ Current render candidates:
 
 - `serial` (default): `qr_v2_geqr2_serial_tpb128_tile32`, template `cuda_geqr2_serial_v1`. Correct-first GEQR2 baseline, one block per matrix, one active thread.
 - `parallel`: `qr_v2_geqr2_parallel_tpb256_tile32`, template `cuda_geqr2_parallel_v1`. One block per matrix, cooperative reductions for column norms and reflector dot products, parallel trailing-column updates.
+- `parallel_profile`: `qr_v2_geqr2_parallel_profile_tpb256_tile32`, template `cuda_geqr2_parallel_profile_v1`. Same math as `parallel`, with device-side `clock64()` phase counters for non-admin profiling.
+- `semantic_upper`: `qr_v2_semantic_upper_fallback_tpb256_tile32`, template `cuda_semantic_upper_fallback_v1`. Routes approximate-upper matrices to `tau=0`, `H=triu(A)`, otherwise falls back to cooperative GEQR2.
+- `semantic_early_stop`: `qr_v2_semantic_early_stop_fallback_tpb256_tile32`, template `cuda_semantic_early_stop_fallback_v1`. Routes a narrow `n=512` near-collinear certificate to a 16-reflector early stop, otherwise falls back to cooperative GEQR2.
+- `semantic_combo`: `qr_v2_semantic_combo_fallback_tpb256_tile32`, template `cuda_semantic_combo_fallback_v1`. Combined upper shortcut, near-collinear early stop, and cooperative GEQR2 fallback. This is the current best semantic prototype.
 
 Rendering a suite writes `data/qr_v2/renders/<suite>/manifest.jsonl`. That manifest points at the most recently rendered candidate for that suite, while artifacts live under candidate-specific subdirectories.
 
@@ -118,48 +122,119 @@ flox activate -- uv sync
 flox activate -- git diff --check
 ```
 
+## H100 Lightning Studio Results
+
+Host used for the current pass: Lightning.AI Studio with an NVIDIA H100 80GB HBM3, CUDA 13.0 user-space packages from Flox, and host driver 580.142-series. The Studio environment does not provide admin access. Nsight Compute performance counters are locked by the host setting `RmProfilingAdminOnly: 1`, so normal-user `ncu` reports `ERR_NVGPUCTRPERM`. Do not try to run project Python as root just to collect counters.
+
+Because NCU counters were unavailable, `parallel_profile` was added with device-side `clock64()` counters. It passed the first-three official `tests` gate on `sm_90`:
+
+```text
+n=32,  batch=20: passed, 209.234 ms
+n=176, batch=40: passed, 25.371 ms
+n=352, batch=40: passed, 134.360 ms
+```
+
+The useful signal was the phase split, not the instrumented wall time:
+
+```text
+n=176: dot 70.56%, update 28.06%, norm 1.06%
+n=352: dot 59.50%, update 39.84%, norm 0.37%
+```
+
+So norm/scale tuning is not the next lever. The hot path is reflector dot products plus trailing updates.
+
+Semantic feasibility probes were expanded to `semantic_v2`. They now record exact/approx-upper rate, early-stop stop-k distribution, zero-`tau` reflector rate, rank/stable-rank proxies, row/column spans, route classes, compaction survivor fractions, and an estimated speedup ceiling. The important H100 probe findings on `tests` were:
+
+```text
+dense n=176/352: no semantic slack, stop_k=n
+nearcollinear n=512: stop50=16, saved ~90.9%, ceiling ~11.0x
+clustered n=512: stop50=256, saved ~12.5%, ceiling ~1.14x
+rankdef n=512: zero_tau_rate=25%, early stop only at 384
+upper n=4096: upper_rate=1.0, approx_upper=1.0
+mixed n=512: mostly dense, one zero-tail route in the test seed
+```
+
+Three semantic CUDA prototypes were added and validated on H100:
+
+```text
+semantic_upper:
+  dense n=32/176/352 guard: passed
+  upper n=4096 official test row: passed
+  pure launcher timing on pre-generated upper n=4096:
+    semantic_upper 20.83 ms median vs parallel 34.93 ms
+
+semantic_early_stop:
+  dense n=32/176/352 guard: passed
+  nearcollinear n=512 official test row: passed
+  pure launcher timing on pre-generated nearcollinear n=512:
+    semantic_early_stop 19.29 ms median vs parallel 226.10 ms
+
+semantic_combo:
+  dense n=32/176/352 guard: passed
+  nearcollinear n=512 official test row: passed
+  upper n=4096 official test row: passed
+  pure launcher timing on pre-generated inputs:
+    nearcollinear n=512: semantic_combo 19.26 ms vs parallel 226.12 ms
+    upper n=4096:       semantic_combo 20.62 ms vs parallel 34.96 ms
+```
+
+These are real semantic wins, but they mostly do not hit the official benchmark distribution. The benchmark list in `docs/task.md` does not include the standalone `upper n=4096` or `nearcollinear n=512` cases. A lightweight benchmark-suite route probe showed the current `semantic_combo` routes trigger on zero benchmark matrices:
+
+```text
+upper route: 0 benchmark matrices
+early-stop route: 0 benchmark matrices
+```
+
+Therefore the current candidate is useful evidence and a correctness foothold, but it is not plausibly in the public B200 leaderboard range yet. The dense benchmark cases still fall back to the one-block cooperative GEQR2 kernel, which is far too slow for a ~2-4 ms geometric mean.
+
+Final checks passed after the H100 semantic work:
+
+```sh
+flox activate -- uv run ruff check .
+flox activate -- uv run ty check
+flox activate -- git diff --check
+```
+
 ## Alignment With Proposal And Plan
 
-`docs/proposal.md` and `docs/plan.md` describe the larger strategy: build a semantic work-reduction tournament, not just a faster fixed QR kernel. The current repo is aligned with the early infrastructure part of that plan: it has deterministic input generation, a local checker, candidate rendering, compile/run manifests, correctness result records, and a first native CUDA candidate. It is not yet aligned with the later tournament architecture: there is no PyTorch extension API, no cuSOLVER/cuSolverDx fallback, no candidate registry, no semantic feasibility table, and no frozen dispatch system.
+`docs/proposal.md` and `docs/plan.md` describe the larger strategy: build a semantic work-reduction tournament, not just a faster fixed QR kernel. The repo is now aligned with the early infrastructure and semantic-feasibility parts of that plan: deterministic input generation, checker, candidate rendering, compile/run manifests, result records, native CUDA candidates, device-side profile summaries, and a semantic probe table. It is still missing the later tournament architecture: no PyTorch extension API, no cuSOLVER/cuSolverDx fallback, no candidate registry, no frozen dispatch system, and no benchmark-relevant dense backend.
 
-Treat the current parallel GEQR2 kernel as a correctness and profiling foothold. Do not let it become the whole strategy unless the semantic probes show no useful slack.
+Treat the current `semantic_combo` candidate as a proof that semantic routing can pass the checker, not as a leaderboard-ready implementation.
 
 ## Next Steps
 
-Move to the H100 next. Save the B200 until after the H100 pass answers two questions: whether the current CUDA path is portable/timing-sane on a stronger GPU, and which semantic work-reduction probes deserve implementation before a real B200 tournament.
+Stay on H100 for more development. Use B200 only after there is a benchmark-relevant candidate worth timing. The next H100 work should target the actual benchmark set from `docs/task.md`:
 
-On H100, use `qr-v2 plan-compile --gpu-arch sm_90`. For B200 later, confirm the supported Blackwell target with `nvcc --list-gpu-arch` on that machine before planning compiles.
+1. Add benchmark-relevant semantic routes:
+   - `rankdef n=512, batch=640`: exact zero-tail/zero-column route that skips the last 128 reflectors and avoids dead trailing work.
+   - `clustered n=512, batch=640`: early-stop or low-rank route around `k=256`; current probe suggests only moderate upside but it is in the benchmark set.
+   - `mixed n=512/1024`: per-matrix routing and compaction; whole-batch routing is invalid because the batch is heterogeneous.
+   - `nearrank n=1024, batch=60`: add a lighter feasibility probe and route if stop/slack is real.
 
-Then rerun the first-three test gate on H100 with the parallel candidate:
+2. Add a real dense backend path:
+   - Current one-block GEQR2 is still the limiting path for dense `512/1024/2048/4096`.
+   - Evaluate cuSOLVER/cuSolverDx availability first, then consider tiled or multi-block QR.
+   - The profiler already showed dot/update dominance, so a dense custom path must address trailing updates and reflector dots, not just norm reductions.
 
-```sh
-flox activate -- uv run qr-v2 render --suite tests --limit 3 --candidate parallel
-flox activate -- uv run qr-v2 plan-compile --suite tests --gpu-arch sm_90
-flox activate -- uv run qr-v2 compile --suite tests --timeout-seconds 60
-flox activate -- uv run qr-v2 plan-run --suite tests
-flox activate -- uv run qr-v2 run --suite tests --limit 3
-flox activate -- uv run qr-v2 verify-run-results --suite tests
-```
+3. Improve benchmark estimation before B200:
+   - Run lightweight benchmark probes by default; the full `benchmarks` probe with SVD/early-stop enabled is too heavy because `batch=640, n=512` SVD dominates.
+   - Add candidate-level route counters (`upper_count`, `early_stop_count`, `zero_tail_count`, `fallback_count`) to run records so benchmark estimates do not depend on offline inference.
+   - Once routes hit benchmark cases, run a H100 benchmark slice and compute a local geometric mean.
 
-If that passes, profile `n=176` and `n=352` with Nsight Compute. Look first at time spent in reductions, reflector dot products, and trailing updates.
+Switch to B200 when one of these is true:
 
-After the H100 gate, return to the proposal/plan priorities before spending B200 time:
+- H100 benchmark-suite geomean is plausibly within a few times the 2-4 ms leaderboard range after architectural scaling, or
+- There is a combined candidate with benchmark-relevant routes for rankdef/clustered/mixed/nearrank plus a better dense fallback, and the goal is final timing/tuning.
 
-- Add semantic feasibility probes and summary output for early-stop rate, approximate-upper shortcut rate, column-scale span, zero-tail reflector frequency, and routing/compaction overhead.
-- Build a small baseline portfolio: current serial/parallel kernels plus a vendor fallback path if cuSOLVER/cuSolverDx is available in the environment.
-- Start recording result fields needed by the tournament plan, especially `candidate_id`, runtime, residual diagnostics, fallback count, and stop panel.
-- Use those data to decide whether to implement early stop, upper-triangular shortcut, power-of-two gauge, speculative fast path, or a bigger tiled/multi-block QR core first.
-
-Likely implementation paths:
-
-- If semantic probes show slack, implement the highest-yield semantic operator first; proposal priority is early stop, then structural shortcut, gauge/speculative fast path, and per-matrix routing.
-- If semantic probes show little slack on the relevant cases, focus on backend work: tiled or multi-block QR for `n>=512`, vendor baselines, and eventually cuBLASLt/CUTLASS-style updates.
-- Always keep `passed` as the gate; compare residual diagnostics against the serial candidate when changing math order.
+On B200, first confirm the supported Blackwell target with `nvcc --list-gpu-arch`; do not assume the right `sm_` value. Then run a tight validation/timing slice before the full benchmark suite.
 
 ## Gotchas
 
 - The worktree is intentionally dirty during this session; do not reset unrelated changes.
-- `plan-compile` defaults to `sm_89`; pass `--gpu-arch sm_90` on H100.
+- Run commands through Flox from the repo root: `flox activate -- ...`. Do not fall back to system-wide Python or packages unless Flox truly lacks the tool.
+- In this Lightning Studio, the normal command sandbox may fail with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`; escalated command execution has been needed, but commands should still run as the Studio user and inside Flox.
+- `plan-compile` defaults to `sm_89`; pass `--gpu-arch sm_90` on H100. On B200, confirm the target with `nvcc --list-gpu-arch`.
+- Nsight Compute performance counters are unavailable without admin/host changes in this Studio; prefer device-side instrumentation or ordinary wall-clock timing.
 - No `pytest` dependency has been added yet; verification is CLI/manifests/JSONL-first.
 - Keep generated artifacts under `data/qr_v2/`.
 - Keep dependencies local to Flox/uv. Do not globally install Python packages or CUDA tools.

@@ -44,9 +44,45 @@ PARALLEL_KERNEL_CONFIG = QrV2KernelConfig(
     unroll=1,
 )
 
+PARALLEL_PROFILE_KERNEL_CONFIG = QrV2KernelConfig(
+    candidate_id="qr_v2_geqr2_parallel_profile_tpb256_tile32",
+    template_id="cuda_geqr2_parallel_profile_v1",
+    threads_per_block=256,
+    tile_size=32,
+    unroll=1,
+)
+
+SEMANTIC_UPPER_KERNEL_CONFIG = QrV2KernelConfig(
+    candidate_id="qr_v2_semantic_upper_fallback_tpb256_tile32",
+    template_id="cuda_semantic_upper_fallback_v1",
+    threads_per_block=256,
+    tile_size=32,
+    unroll=1,
+)
+
+SEMANTIC_EARLY_STOP_KERNEL_CONFIG = QrV2KernelConfig(
+    candidate_id="qr_v2_semantic_early_stop_fallback_tpb256_tile32",
+    template_id="cuda_semantic_early_stop_fallback_v1",
+    threads_per_block=256,
+    tile_size=32,
+    unroll=1,
+)
+
+SEMANTIC_COMBO_KERNEL_CONFIG = QrV2KernelConfig(
+    candidate_id="qr_v2_semantic_combo_fallback_tpb256_tile32",
+    template_id="cuda_semantic_combo_fallback_v1",
+    threads_per_block=256,
+    tile_size=32,
+    unroll=1,
+)
+
 KERNEL_CONFIGS: dict[str, QrV2KernelConfig] = {
     "serial": SERIAL_KERNEL_CONFIG,
     "parallel": PARALLEL_KERNEL_CONFIG,
+    "parallel_profile": PARALLEL_PROFILE_KERNEL_CONFIG,
+    "semantic_upper": SEMANTIC_UPPER_KERNEL_CONFIG,
+    "semantic_early_stop": SEMANTIC_EARLY_STOP_KERNEL_CONFIG,
+    "semantic_combo": SEMANTIC_COMBO_KERNEL_CONFIG,
 }
 DEFAULT_KERNEL_CONFIG = SERIAL_KERNEL_CONFIG
 
@@ -354,9 +390,716 @@ extern "C" __attribute__((visibility("default"))) int {{ config.entry_point }}_l
 }
 """
 
+
+_UPPER_SHORTCUT_INIT_BLOCK = """    double local_norm1 = 0.0;
+    double local_strictlower_norm1 = 0.0;
+    for (int col = tid; col < n; col += blockDim.x) {
+        double column_sum = 0.0;
+        double strictlower_column_sum = 0.0;
+        for (int row = 0; row < n; ++row) {
+            const double abs_value = fabs(static_cast<double>(a[matrix_offset + row * n + col]));
+            column_sum += abs_value;
+            if (row > col) {
+                strictlower_column_sum += abs_value;
+            }
+        }
+        local_norm1 = fmax(local_norm1, column_sum);
+        local_strictlower_norm1 = fmax(local_strictlower_norm1, strictlower_column_sum);
+    }
+
+    reduce_buffer[tid] = local_norm1;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce_buffer[tid] = fmax(reduce_buffer[tid], reduce_buffer[tid + stride]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        shared_norm1 = reduce_buffer[0];
+    }
+    __syncthreads();
+
+    reduce_buffer[tid] = local_strictlower_norm1;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce_buffer[tid] = fmax(reduce_buffer[tid], reduce_buffer[tid + stride]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        shared_strictlower_norm1 = reduce_buffer[0];
+        const double eps = 1.1920928955078125e-7;
+        const double threshold = 20.0 * static_cast<double>(n) * eps * fmax(shared_norm1, 1.0e-30);
+        shared_shortcut = shared_strictlower_norm1 <= threshold ? 1 : 0;
+    }
+    __syncthreads();
+
+    if (shared_shortcut != 0) {
+        for (int idx = tid; idx < n * n; idx += blockDim.x) {
+            const int row = idx / n;
+            const int col = idx - row * n;
+            h[matrix_offset + idx] = row <= col ? a[matrix_offset + idx] : 0.0f;
+        }
+        for (int k = tid; k < n; k += blockDim.x) {
+            tau[tau_offset + k] = 0.0f;
+        }
+        return;
+    }
+
+    for (int idx = tid; idx < n * n; idx += blockDim.x) {
+        h[matrix_offset + idx] = a[matrix_offset + idx];
+    }
+    for (int k = tid; k < n; k += blockDim.x) {
+        tau[tau_offset + k] = 0.0f;
+    }
+    __syncthreads();
+"""
+
+_CUDA_SEMANTIC_UPPER_FALLBACK_TEMPLATE = (
+    _CUDA_GEQR2_PARALLEL_TEMPLATE.replace(
+        "Correct-first cooperative GEQR2 implementation with block reductions.",
+        "Approximate-upper shortcut with cooperative GEQR2 fallback.",
+    )
+    .replace(
+        "__shared__ int shared_active;\n\n    const int matrix_offset",
+        "__shared__ int shared_active;\n"
+        "    __shared__ int shared_shortcut;\n"
+        "    __shared__ double shared_norm1;\n"
+        "    __shared__ double shared_strictlower_norm1;\n\n"
+        "    const int matrix_offset",
+    )
+    .replace(
+        """    for (int idx = tid; idx < n * n; idx += blockDim.x) {
+        h[matrix_offset + idx] = a[matrix_offset + idx];
+    }
+    for (int k = tid; k < n; k += blockDim.x) {
+        tau[tau_offset + k] = 0.0f;
+    }
+    __syncthreads();
+""",
+        _UPPER_SHORTCUT_INIT_BLOCK,
+        1,
+    )
+)
+
+_EARLY_STOP_INIT_BLOCK = """    if (tid == 0) {
+        shared_early_stop = 0;
+    }
+    __syncthreads();
+
+    if (n == 512) {
+        double local_column_min = 1.0e300;
+        double local_column_max = 0.0;
+        for (int col = tid; col < n; col += blockDim.x) {
+            double column_sum = 0.0;
+            for (int row = 0; row < n; ++row) {
+                column_sum += fabs(static_cast<double>(a[matrix_offset + row * n + col]));
+            }
+            local_column_min = fmin(local_column_min, column_sum);
+            local_column_max = fmax(local_column_max, column_sum);
+        }
+
+        reduce_buffer[tid] = local_column_min;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buffer[tid] = fmin(reduce_buffer[tid], reduce_buffer[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            shared_column_min = reduce_buffer[0];
+        }
+        __syncthreads();
+
+        reduce_buffer[tid] = local_column_max;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buffer[tid] = fmax(reduce_buffer[tid], reduce_buffer[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            shared_column_max = reduce_buffer[0];
+        }
+        __syncthreads();
+
+        double local_row_min = 1.0e300;
+        double local_row_max = 0.0;
+        for (int row = tid; row < n; row += blockDim.x) {
+            double row_sum = 0.0;
+            for (int col = 0; col < n; ++col) {
+                row_sum += fabs(static_cast<double>(a[matrix_offset + row * n + col]));
+            }
+            local_row_min = fmin(local_row_min, row_sum);
+            local_row_max = fmax(local_row_max, row_sum);
+        }
+
+        reduce_buffer[tid] = local_row_min;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buffer[tid] = fmin(reduce_buffer[tid], reduce_buffer[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            shared_row_min = reduce_buffer[0];
+        }
+        __syncthreads();
+
+        reduce_buffer[tid] = local_row_max;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buffer[tid] = fmax(reduce_buffer[tid], reduce_buffer[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            shared_row_max = reduce_buffer[0];
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            const double column_span = shared_column_max / fmax(shared_column_min, 1.0e-30);
+            const double row_span = shared_row_max / fmax(shared_row_min, 1.0e-30);
+            shared_early_stop = (column_span <= 1.05 && row_span >= 64.0) ? 1 : 0;
+        }
+        __syncthreads();
+    }
+
+    for (int idx = tid; idx < n * n; idx += blockDim.x) {
+        h[matrix_offset + idx] = a[matrix_offset + idx];
+    }
+    for (int k = tid; k < n; k += blockDim.x) {
+        tau[tau_offset + k] = 0.0f;
+    }
+    __syncthreads();
+"""
+
+_CUDA_SEMANTIC_EARLY_STOP_FALLBACK_TEMPLATE = (
+    _CUDA_GEQR2_PARALLEL_TEMPLATE.replace(
+        "Correct-first cooperative GEQR2 implementation with block reductions.",
+        "Near-collinear early-stop shortcut with cooperative GEQR2 fallback.",
+    )
+    .replace(
+        "__shared__ int shared_active;\n\n    const int matrix_offset",
+        "__shared__ int shared_active;\n"
+        "    __shared__ int shared_early_stop;\n"
+        "    __shared__ double shared_column_min;\n"
+        "    __shared__ double shared_column_max;\n"
+        "    __shared__ double shared_row_min;\n"
+        "    __shared__ double shared_row_max;\n\n"
+        "    const int matrix_offset",
+    )
+    .replace(
+        """    for (int idx = tid; idx < n * n; idx += blockDim.x) {
+        h[matrix_offset + idx] = a[matrix_offset + idx];
+    }
+    for (int k = tid; k < n; k += blockDim.x) {
+        tau[tau_offset + k] = 0.0f;
+    }
+    __syncthreads();
+""",
+        _EARLY_STOP_INIT_BLOCK,
+        1,
+    )
+    .replace(
+        "    for (int k = 0; k < n; ++k) {",
+        "    const int qr_stop_k = shared_early_stop != 0 ? 16 : n;\n\n    for (int k = 0; k < qr_stop_k; ++k) {",
+        1,
+    )
+)
+
+_SEMANTIC_COMBO_INIT_BLOCK = """    if (tid == 0) {
+        shared_shortcut = 0;
+        shared_early_stop = 0;
+    }
+    __syncthreads();
+
+    double local_norm1 = 0.0;
+    double local_strictlower_norm1 = 0.0;
+    for (int col = tid; col < n; col += blockDim.x) {
+        double column_sum = 0.0;
+        double strictlower_column_sum = 0.0;
+        for (int row = 0; row < n; ++row) {
+            const double abs_value = fabs(static_cast<double>(a[matrix_offset + row * n + col]));
+            column_sum += abs_value;
+            if (row > col) {
+                strictlower_column_sum += abs_value;
+            }
+        }
+        local_norm1 = fmax(local_norm1, column_sum);
+        local_strictlower_norm1 = fmax(local_strictlower_norm1, strictlower_column_sum);
+    }
+
+    reduce_buffer[tid] = local_norm1;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce_buffer[tid] = fmax(reduce_buffer[tid], reduce_buffer[tid + stride]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        shared_norm1 = reduce_buffer[0];
+    }
+    __syncthreads();
+
+    reduce_buffer[tid] = local_strictlower_norm1;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce_buffer[tid] = fmax(reduce_buffer[tid], reduce_buffer[tid + stride]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        shared_strictlower_norm1 = reduce_buffer[0];
+        const double eps = 1.1920928955078125e-7;
+        const double threshold = 20.0 * static_cast<double>(n) * eps * fmax(shared_norm1, 1.0e-30);
+        shared_shortcut = shared_strictlower_norm1 <= threshold ? 1 : 0;
+    }
+    __syncthreads();
+
+    if (shared_shortcut != 0) {
+        for (int idx = tid; idx < n * n; idx += blockDim.x) {
+            const int row = idx / n;
+            const int col = idx - row * n;
+            h[matrix_offset + idx] = row <= col ? a[matrix_offset + idx] : 0.0f;
+        }
+        for (int k = tid; k < n; k += blockDim.x) {
+            tau[tau_offset + k] = 0.0f;
+        }
+        return;
+    }
+
+    if (n == 512) {
+        double local_column_min = 1.0e300;
+        double local_column_max = 0.0;
+        for (int col = tid; col < n; col += blockDim.x) {
+            double column_sum = 0.0;
+            for (int row = 0; row < n; ++row) {
+                column_sum += fabs(static_cast<double>(a[matrix_offset + row * n + col]));
+            }
+            local_column_min = fmin(local_column_min, column_sum);
+            local_column_max = fmax(local_column_max, column_sum);
+        }
+
+        reduce_buffer[tid] = local_column_min;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buffer[tid] = fmin(reduce_buffer[tid], reduce_buffer[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            shared_column_min = reduce_buffer[0];
+        }
+        __syncthreads();
+
+        reduce_buffer[tid] = local_column_max;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buffer[tid] = fmax(reduce_buffer[tid], reduce_buffer[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            shared_column_max = reduce_buffer[0];
+        }
+        __syncthreads();
+
+        double local_row_min = 1.0e300;
+        double local_row_max = 0.0;
+        for (int row = tid; row < n; row += blockDim.x) {
+            double row_sum = 0.0;
+            for (int col = 0; col < n; ++col) {
+                row_sum += fabs(static_cast<double>(a[matrix_offset + row * n + col]));
+            }
+            local_row_min = fmin(local_row_min, row_sum);
+            local_row_max = fmax(local_row_max, row_sum);
+        }
+
+        reduce_buffer[tid] = local_row_min;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buffer[tid] = fmin(reduce_buffer[tid], reduce_buffer[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            shared_row_min = reduce_buffer[0];
+        }
+        __syncthreads();
+
+        reduce_buffer[tid] = local_row_max;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buffer[tid] = fmax(reduce_buffer[tid], reduce_buffer[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            shared_row_max = reduce_buffer[0];
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            const double column_span = shared_column_max / fmax(shared_column_min, 1.0e-30);
+            const double row_span = shared_row_max / fmax(shared_row_min, 1.0e-30);
+            shared_early_stop = (column_span <= 1.05 && row_span >= 64.0) ? 1 : 0;
+        }
+        __syncthreads();
+    }
+
+    for (int idx = tid; idx < n * n; idx += blockDim.x) {
+        h[matrix_offset + idx] = a[matrix_offset + idx];
+    }
+    for (int k = tid; k < n; k += blockDim.x) {
+        tau[tau_offset + k] = 0.0f;
+    }
+    __syncthreads();
+"""
+
+_CUDA_SEMANTIC_COMBO_FALLBACK_TEMPLATE = (
+    _CUDA_GEQR2_PARALLEL_TEMPLATE.replace(
+        "Correct-first cooperative GEQR2 implementation with block reductions.",
+        "Upper shortcut and near-collinear early-stop routes with cooperative GEQR2 fallback.",
+    )
+    .replace(
+        "__shared__ int shared_active;\n\n    const int matrix_offset",
+        "__shared__ int shared_active;\n"
+        "    __shared__ int shared_shortcut;\n"
+        "    __shared__ int shared_early_stop;\n"
+        "    __shared__ double shared_norm1;\n"
+        "    __shared__ double shared_strictlower_norm1;\n"
+        "    __shared__ double shared_column_min;\n"
+        "    __shared__ double shared_column_max;\n"
+        "    __shared__ double shared_row_min;\n"
+        "    __shared__ double shared_row_max;\n\n"
+        "    const int matrix_offset",
+    )
+    .replace(
+        """    for (int idx = tid; idx < n * n; idx += blockDim.x) {
+        h[matrix_offset + idx] = a[matrix_offset + idx];
+    }
+    for (int k = tid; k < n; k += blockDim.x) {
+        tau[tau_offset + k] = 0.0f;
+    }
+    __syncthreads();
+""",
+        _SEMANTIC_COMBO_INIT_BLOCK,
+        1,
+    )
+    .replace(
+        "    for (int k = 0; k < n; ++k) {",
+        "    const int qr_stop_k = shared_early_stop != 0 ? 16 : n;\n\n    for (int k = 0; k < qr_stop_k; ++k) {",
+        1,
+    )
+)
+
+_CUDA_GEQR2_PARALLEL_PROFILE_TEMPLATE = """// Generated by gpumode.qr_v2 {{ renderer_version }}.
+// Correct-first cooperative GEQR2 implementation with block-level clock64 phase counters.
+//
+// candidate_id: {{ config.candidate_id }}
+// template_id: {{ config.template_id }}
+// entry_point: {{ config.entry_point }}
+// eval: {{ spec.eval_line(include_dense_case=True) }}
+// shape: batch={{ spec.batch }}, n={{ spec.n }}, cond={{ spec.cond }}, case={{ spec.case }}, seed={{ spec.seed }}
+// sweep: threads_per_block={{ config.threads_per_block }}, tile_size={{ config.tile_size }}, unroll={{ config.unroll }}
+// profile fields: total_cycles, init_cycles, norm_cycles, scale_cycles, dot_cycles, update_cycles,
+//                 active_reflectors, inactive_reflectors, trailing_columns
+
+#include <cuda_runtime.h>
+#include <math.h>
+
+static constexpr int QR_V2_PROFILE_FIELD_COUNT = 9;
+static constexpr int QR_V2_PROFILE_TOTAL_CYCLES = 0;
+static constexpr int QR_V2_PROFILE_INIT_CYCLES = 1;
+static constexpr int QR_V2_PROFILE_NORM_CYCLES = 2;
+static constexpr int QR_V2_PROFILE_SCALE_CYCLES = 3;
+static constexpr int QR_V2_PROFILE_DOT_CYCLES = 4;
+static constexpr int QR_V2_PROFILE_UPDATE_CYCLES = 5;
+static constexpr int QR_V2_PROFILE_ACTIVE_REFLECTORS = 6;
+static constexpr int QR_V2_PROFILE_INACTIVE_REFLECTORS = 7;
+static constexpr int QR_V2_PROFILE_TRAILING_COLUMNS = 8;
+
+extern "C" __global__ void {{ config.entry_point }}(
+    const float* __restrict__ a,
+    float* __restrict__ h,
+    float* __restrict__ tau,
+    unsigned long long* __restrict__ profile,
+    int batch,
+    int n,
+    int profile_stride
+) {
+    const int matrix_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (matrix_idx >= batch) {
+        return;
+    }
+
+    __shared__ double reduce_buffer[1024];
+    __shared__ double shared_tau;
+    __shared__ double shared_scale;
+    __shared__ double shared_update;
+    __shared__ int shared_active;
+    __shared__ unsigned long long phase_start;
+    __shared__ unsigned long long total_start;
+    __shared__ unsigned long long cycles_init;
+    __shared__ unsigned long long cycles_norm;
+    __shared__ unsigned long long cycles_scale;
+    __shared__ unsigned long long cycles_dot;
+    __shared__ unsigned long long cycles_update;
+    __shared__ unsigned long long active_reflectors;
+    __shared__ unsigned long long inactive_reflectors;
+    __shared__ unsigned long long trailing_columns;
+
+    const int matrix_offset = matrix_idx * n * n;
+    const int tau_offset = matrix_idx * n;
+
+    if (tid == 0) {
+        cycles_init = 0ULL;
+        cycles_norm = 0ULL;
+        cycles_scale = 0ULL;
+        cycles_dot = 0ULL;
+        cycles_update = 0ULL;
+        active_reflectors = 0ULL;
+        inactive_reflectors = 0ULL;
+        trailing_columns = 0ULL;
+        total_start = clock64();
+        phase_start = total_start;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        phase_start = clock64();
+    }
+    __syncthreads();
+    for (int idx = tid; idx < n * n; idx += blockDim.x) {
+        h[matrix_offset + idx] = a[matrix_offset + idx];
+    }
+    for (int k = tid; k < n; k += blockDim.x) {
+        tau[tau_offset + k] = 0.0f;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        cycles_init += clock64() - phase_start;
+    }
+    __syncthreads();
+
+    for (int k = 0; k < n; ++k) {
+        if (tid == 0) {
+            phase_start = clock64();
+        }
+        __syncthreads();
+        double local_sum = 0.0;
+        for (int row = k + 1 + tid; row < n; row += blockDim.x) {
+            const double value = static_cast<double>(h[matrix_offset + row * n + k]);
+            local_sum += value * value;
+        }
+        reduce_buffer[tid] = local_sum;
+        __syncthreads();
+
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buffer[tid] += reduce_buffer[tid + stride];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            const int kk = matrix_offset + k * n + k;
+            const double alpha = static_cast<double>(h[kk]);
+            const double xnorm2 = reduce_buffer[0];
+            if (xnorm2 == 0.0) {
+                tau[tau_offset + k] = 0.0f;
+                shared_tau = 0.0;
+                shared_scale = 0.0;
+                shared_active = 0;
+            } else {
+                const double norm = sqrt(alpha * alpha + xnorm2);
+                const double beta = alpha >= 0.0 ? -norm : norm;
+                const double tau_k = (beta - alpha) / beta;
+                shared_tau = tau_k;
+                shared_scale = 1.0 / (alpha - beta);
+                shared_active = 1;
+                h[kk] = static_cast<float>(beta);
+                tau[tau_offset + k] = static_cast<float>(tau_k);
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            cycles_norm += clock64() - phase_start;
+            if (shared_active == 0) {
+                inactive_reflectors += 1ULL;
+            } else {
+                active_reflectors += 1ULL;
+            }
+        }
+        __syncthreads();
+
+        if (shared_active == 0) {
+            continue;
+        }
+
+        if (tid == 0) {
+            phase_start = clock64();
+        }
+        __syncthreads();
+        for (int row = k + 1 + tid; row < n; row += blockDim.x) {
+            const int index = matrix_offset + row * n + k;
+            h[index] = static_cast<float>(static_cast<double>(h[index]) * shared_scale);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            cycles_scale += clock64() - phase_start;
+        }
+        __syncthreads();
+
+        for (int col = k + 1; col < n; ++col) {
+            if (tid == 0) {
+                phase_start = clock64();
+            }
+            __syncthreads();
+            double dot = tid == 0 ? static_cast<double>(h[matrix_offset + k * n + col]) : 0.0;
+            for (int row = k + 1 + tid; row < n; row += blockDim.x) {
+                dot += static_cast<double>(h[matrix_offset + row * n + k]) *
+                       static_cast<double>(h[matrix_offset + row * n + col]);
+            }
+            reduce_buffer[tid] = dot;
+            __syncthreads();
+
+            for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    reduce_buffer[tid] += reduce_buffer[tid + stride];
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0) {
+                shared_update = shared_tau * reduce_buffer[0];
+                cycles_dot += clock64() - phase_start;
+            }
+            __syncthreads();
+
+            if (tid == 0) {
+                phase_start = clock64();
+            }
+            __syncthreads();
+            if (tid == 0) {
+                const int top_index = matrix_offset + k * n + col;
+                h[top_index] = static_cast<float>(static_cast<double>(h[top_index]) - shared_update);
+            }
+
+            for (int row = k + 1 + tid; row < n; row += blockDim.x) {
+                const int index = matrix_offset + row * n + col;
+                h[index] = static_cast<float>(
+                    static_cast<double>(h[index]) - static_cast<double>(h[matrix_offset + row * n + k]) * shared_update
+                );
+            }
+            __syncthreads();
+            if (tid == 0) {
+                cycles_update += clock64() - phase_start;
+                trailing_columns += 1ULL;
+            }
+            __syncthreads();
+        }
+    }
+
+    __syncthreads();
+    if (tid == 0 && profile != nullptr && profile_stride >= QR_V2_PROFILE_FIELD_COUNT) {
+        const int profile_offset = matrix_idx * profile_stride;
+        profile[profile_offset + QR_V2_PROFILE_TOTAL_CYCLES] = clock64() - total_start;
+        profile[profile_offset + QR_V2_PROFILE_INIT_CYCLES] = cycles_init;
+        profile[profile_offset + QR_V2_PROFILE_NORM_CYCLES] = cycles_norm;
+        profile[profile_offset + QR_V2_PROFILE_SCALE_CYCLES] = cycles_scale;
+        profile[profile_offset + QR_V2_PROFILE_DOT_CYCLES] = cycles_dot;
+        profile[profile_offset + QR_V2_PROFILE_UPDATE_CYCLES] = cycles_update;
+        profile[profile_offset + QR_V2_PROFILE_ACTIVE_REFLECTORS] = active_reflectors;
+        profile[profile_offset + QR_V2_PROFILE_INACTIVE_REFLECTORS] = inactive_reflectors;
+        profile[profile_offset + QR_V2_PROFILE_TRAILING_COLUMNS] = trailing_columns;
+    }
+}
+
+extern "C" __attribute__((visibility("default"))) int {{ config.entry_point }}_launch(
+    const float* a,
+    float* h,
+    float* tau,
+    int batch,
+    int n,
+    int threads_per_block
+) {
+    if (a == nullptr || h == nullptr || tau == nullptr || batch <= 0 || n <= 0 || threads_per_block <= 0) {
+        return -1;
+    }
+    if (threads_per_block > 1024 || (threads_per_block & (threads_per_block - 1)) != 0) {
+        return -2;
+    }
+
+    {{ config.entry_point }}<<<batch, threads_per_block>>>(a, h, tau, nullptr, batch, n, 0);
+    cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+        return static_cast<int>(launch_status);
+    }
+
+    cudaError_t sync_status = cudaDeviceSynchronize();
+    if (sync_status != cudaSuccess) {
+        return static_cast<int>(sync_status);
+    }
+    return 0;
+}
+
+extern "C" __attribute__((visibility("default"))) int {{ config.entry_point }}_launch_profile(
+    const float* a,
+    float* h,
+    float* tau,
+    unsigned long long* profile,
+    int batch,
+    int n,
+    int threads_per_block,
+    int profile_stride
+) {
+    if (a == nullptr || h == nullptr || tau == nullptr || profile == nullptr || batch <= 0 || n <= 0 || threads_per_block <= 0) {
+        return -1;
+    }
+    if (threads_per_block > 1024 || (threads_per_block & (threads_per_block - 1)) != 0) {
+        return -2;
+    }
+    if (profile_stride < QR_V2_PROFILE_FIELD_COUNT) {
+        return -3;
+    }
+
+    {{ config.entry_point }}<<<batch, threads_per_block>>>(a, h, tau, profile, batch, n, profile_stride);
+    cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+        return static_cast<int>(launch_status);
+    }
+
+    cudaError_t sync_status = cudaDeviceSynchronize();
+    if (sync_status != cudaSuccess) {
+        return static_cast<int>(sync_status);
+    }
+    return 0;
+}
+"""
+
 _CUDA_TEMPLATES = {
     "cuda_geqr2_serial_v1": _CUDA_GEQR2_SERIAL_TEMPLATE,
     "cuda_geqr2_parallel_v1": _CUDA_GEQR2_PARALLEL_TEMPLATE,
+    "cuda_geqr2_parallel_profile_v1": _CUDA_GEQR2_PARALLEL_PROFILE_TEMPLATE,
+    "cuda_semantic_upper_fallback_v1": _CUDA_SEMANTIC_UPPER_FALLBACK_TEMPLATE,
+    "cuda_semantic_early_stop_fallback_v1": _CUDA_SEMANTIC_EARLY_STOP_FALLBACK_TEMPLATE,
+    "cuda_semantic_combo_fallback_v1": _CUDA_SEMANTIC_COMBO_FALLBACK_TEMPLATE,
 }
 
 _JINJA_ENV = Environment(

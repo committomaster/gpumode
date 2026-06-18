@@ -49,12 +49,17 @@ _RICH_COLUMNS = {
         "shape",
         "cond",
         "records",
-        "upper_mean",
-        "upper_max",
-        "zero_cols",
-        "tiny_cols",
-        "col_span",
-        "row_span",
+        "upper_rate",
+        "approx_upper",
+        "stop50",
+        "stop90",
+        "stop_n4",
+        "saved",
+        "speedup",
+        "zero_tau",
+        "rank_frac",
+        "surv_n4",
+        "col_span50",
     ],
 }
 
@@ -73,10 +78,26 @@ _RIGHT_ALIGNED_COLUMNS = {
     "recon",
     "upper_mean",
     "upper_max",
+    "upper_rate",
+    "approx_upper",
+    "stop50",
+    "stop90",
+    "stop_n4",
+    "stop_n2",
+    "saved",
+    "speedup",
+    "zero_tau",
+    "zero_suffix",
+    "rank50",
+    "rank_frac",
+    "surv_n4",
+    "surv_n2",
     "zero_cols",
     "tiny_cols",
     "col_span",
+    "col_span50",
     "row_span",
+    "row_span50",
     "norm1_mean",
 }
 
@@ -98,10 +119,26 @@ _HEADER_LABELS = {
     "recon": "rec",
     "upper_mean": "upper avg",
     "upper_max": "upper max",
+    "upper_rate": "upper",
+    "approx_upper": "approx",
+    "stop50": "stop50",
+    "stop90": "stop90",
+    "stop_n4": "<=n/4",
+    "stop_n2": "<=n/2",
+    "saved": "saved",
+    "speedup": "ceil",
+    "zero_tau": "tau0",
+    "zero_suffix": "tau0 tail",
+    "rank50": "rank50",
+    "rank_frac": "rank/n",
+    "surv_n4": "surv>n/4",
+    "surv_n2": "surv>n/2",
     "zero_cols": "zero",
     "tiny_cols": "tiny",
     "col_span": "col span",
+    "col_span50": "col p50",
     "row_span": "row span",
+    "row_span50": "row p50",
 }
 
 
@@ -128,6 +165,13 @@ def _round_existing_columns(
     if not existing:
         return frame
     return frame.with_columns(pl.col(existing).round(digits))
+
+
+def _with_missing_columns(frame: pl.DataFrame, defaults: dict[str, object]) -> pl.DataFrame:
+    for column, default in defaults.items():
+        if column not in frame.columns:
+            frame = frame.with_columns(pl.lit(default).alias(column))
+    return frame
 
 
 def summarize_baseline(path: Path) -> pl.DataFrame:
@@ -174,9 +218,32 @@ def summarize_baseline(path: Path) -> pl.DataFrame:
 
 
 def summarize_probes(path: Path) -> pl.DataFrame:
-    """Summarize structure probe JSONL records."""
+    """Summarize semantic probe JSONL records."""
 
-    records = _read_event_records(path, "probe_result").with_columns(
+    records = _read_event_records(path, "probe_result")
+    records = _with_missing_columns(
+        records,
+        {
+            "upper_triangular_rate": None,
+            "approx_upper_triangular_rate": None,
+            "early_stop_evaluated": False,
+            "early_stop_median_k": None,
+            "early_stop_p90_k": None,
+            "early_stop_n4_rate": None,
+            "early_stop_n2_rate": None,
+            "early_stop_work_saved_mean": None,
+            "estimated_speedup_ceiling": None,
+            "zero_tau_reflector_rate_mean": None,
+            "zero_tau_suffix_median": None,
+            "rank_probe_evaluated": False,
+            "effective_rank_median": None,
+            "effective_rank_fraction_median": None,
+            "compaction_survivor_fraction_n4": None,
+            "compaction_survivor_fraction_n2": None,
+            "column_l1_span_median": None,
+            "row_l1_span_median": None,
+        },
+    ).with_columns(
         pl.col("upper_triangular_ratio").list.mean().alias("upper_ratio_mean"),
         pl.col("upper_triangular_ratio").list.max().alias("upper_ratio_max"),
         pl.col("zero_column_count").list.max().alias("zero_cols_max"),
@@ -189,10 +256,28 @@ def summarize_probes(path: Path) -> pl.DataFrame:
         pl.len().alias("records"),
         pl.col("upper_ratio_mean").mean().alias("upper_ratio_mean"),
         pl.col("upper_ratio_max").max().alias("upper_ratio_max"),
+        pl.col("upper_triangular_rate").mean().alias("upper_triangular_rate"),
+        pl.col("approx_upper_triangular_rate").mean().alias("approx_upper_triangular_rate"),
+        pl.col("early_stop_evaluated").cast(pl.Int64).sum().alias("early_stop_records"),
+        pl.col("early_stop_median_k").median().alias("early_stop_median_k"),
+        pl.col("early_stop_p90_k").median().alias("early_stop_p90_k"),
+        pl.col("early_stop_n4_rate").mean().alias("early_stop_n4_rate"),
+        pl.col("early_stop_n2_rate").mean().alias("early_stop_n2_rate"),
+        pl.col("early_stop_work_saved_mean").mean().alias("early_stop_work_saved_mean"),
+        pl.col("estimated_speedup_ceiling").mean().alias("estimated_speedup_ceiling"),
+        pl.col("zero_tau_reflector_rate_mean").mean().alias("zero_tau_reflector_rate_mean"),
+        pl.col("zero_tau_suffix_median").median().alias("zero_tau_suffix_median"),
+        pl.col("rank_probe_evaluated").cast(pl.Int64).sum().alias("rank_probe_records"),
+        pl.col("effective_rank_median").median().alias("effective_rank_median"),
+        pl.col("effective_rank_fraction_median").median().alias("effective_rank_fraction_median"),
+        pl.col("compaction_survivor_fraction_n4").mean().alias("compaction_survivor_fraction_n4"),
+        pl.col("compaction_survivor_fraction_n2").mean().alias("compaction_survivor_fraction_n2"),
         pl.col("zero_cols_max").max().alias("zero_cols_max"),
         pl.col("tiny_cols_max").max().alias("tiny_cols_max"),
         pl.col("column_span_max").max().alias("column_span_max"),
+        pl.col("column_l1_span_median").median().alias("column_l1_span_median"),
         pl.col("row_span_max").max().alias("row_span_max"),
+        pl.col("row_l1_span_median").median().alias("row_l1_span_median"),
         pl.col("matrix_l1_mean").mean().alias("matrix_l1_mean"),
     )
 
@@ -201,8 +286,24 @@ def summarize_probes(path: Path) -> pl.DataFrame:
         [
             "upper_ratio_mean",
             "upper_ratio_max",
+            "upper_triangular_rate",
+            "approx_upper_triangular_rate",
+            "early_stop_median_k",
+            "early_stop_p90_k",
+            "early_stop_n4_rate",
+            "early_stop_n2_rate",
+            "early_stop_work_saved_mean",
+            "estimated_speedup_ceiling",
+            "zero_tau_reflector_rate_mean",
+            "zero_tau_suffix_median",
+            "effective_rank_median",
+            "effective_rank_fraction_median",
+            "compaction_survivor_fraction_n4",
+            "compaction_survivor_fraction_n2",
             "column_span_max",
+            "column_l1_span_median",
             "row_span_max",
+            "row_l1_span_median",
             "matrix_l1_mean",
         ],
         4,
@@ -213,10 +314,26 @@ def summarize_probes(path: Path) -> pl.DataFrame:
             "device": "dev",
             "upper_ratio_mean": "upper_mean",
             "upper_ratio_max": "upper_max",
+            "upper_triangular_rate": "upper_rate",
+            "approx_upper_triangular_rate": "approx_upper",
+            "early_stop_median_k": "stop50",
+            "early_stop_p90_k": "stop90",
+            "early_stop_n4_rate": "stop_n4",
+            "early_stop_n2_rate": "stop_n2",
+            "early_stop_work_saved_mean": "saved",
+            "estimated_speedup_ceiling": "speedup",
+            "zero_tau_reflector_rate_mean": "zero_tau",
+            "zero_tau_suffix_median": "zero_suffix",
+            "effective_rank_median": "rank50",
+            "effective_rank_fraction_median": "rank_frac",
+            "compaction_survivor_fraction_n4": "surv_n4",
+            "compaction_survivor_fraction_n2": "surv_n2",
             "zero_cols_max": "zero_cols",
             "tiny_cols_max": "tiny_cols",
             "column_span_max": "col_span",
+            "column_l1_span_median": "col_span50",
             "row_span_max": "row_span",
+            "row_l1_span_median": "row_span50",
             "matrix_l1_mean": "norm1_mean",
         }
     )
