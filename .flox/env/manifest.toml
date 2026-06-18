@@ -3,7 +3,19 @@ schema-version = "1.12.0"
 
 [install]
 age = { pkg-path = "age", version = "1.3.1" }
+cuda_cccl = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_cccl", version = "13.0.85", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 7 }
+cuda_cudart = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_cudart", version = "13.0.96", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 6 }
+cuda_cuobjdump = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_cuobjdump", version = "13.0.85", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 11 }
+cuda_cupti = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_cupti", version = "13.0.85", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 9 }
+cuda_gdb = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_gdb", version = "13.0.85", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 8 }
+cuda_nvcc = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_nvcc", version = "13.0.88", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 4 }
+cuda_nvdisasm = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_nvdisasm", version = "13.0.85", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 12 }
+cuda_nvprune = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_nvprune", version = "13.0.85", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 13 }
+cuda_sanitizer_api = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_sanitizer_api", version = "13.0.85", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 10 }
 gh = { pkg-path = "gh", version = "2.94.0" }
+libgcc = { pkg-path = "libgcc", version = "15.2.0", systems = ["x86_64-linux"] }
+nsight_compute = { pkg-path = "flox-cuda/cudaPackages_13_0.nsight_compute", version = "2025.3.1.4", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 14 }
+nsight_systems = { pkg-path = "flox-cuda/cudaPackages_13_0.nsight_systems", version = "2025.3.2.474", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 15 }
 python = { pkg-path = "python313", version = "python3-3.13.13" }
 sops = { pkg-path = "sops", version = "3.13.1" }
 uv = { pkg-path = "uv", version = "0.11.19" }
@@ -14,4 +26,6 @@ yq = { pkg-path = "yq-go", version = "4.53.3" }
 on-activate = '''
 export PYTHONPATH="$FLOX_ENV_PROJECT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPYCACHEPREFIX="$FLOX_ENV_CACHE/python"
+export UV_NO_MANAGED_PYTHON=1
+export UV_PYTHON="$FLOX_ENV/bin/python"
 '''

@@ -2,6 +2,7 @@
   "recommendations": [
     "astral-sh.ty",
     "charliermarsh.ruff",
-    "flox.flox"
+    "flox.flox",
+    "openai.chatgpt"
   ]
 }
