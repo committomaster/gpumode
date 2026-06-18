@@ -58,8 +58,8 @@ Candidate pipeline:
 - `compile_plan.py`: converts render rows into `nvcc` jobs. The CLI exposes `--gpu-arch`, defaulting to `sm_89` for L4.
 - `compile.py`: executes compile jobs, writes `.so` files and compile-result manifests.
 - `run_plan.py`: converts compile rows into run jobs.
-- `run.py`: loads compiled shared objects with `ctypes`, launches kernels, checks `(H, tau)`, and writes run-result manifests.
-- `cli.py`: exposes `baseline`, `probe`, `summary`, `render`, `verify-renders`, `plan-compile`, `verify-compile-plan`, `compile-one`, `compile`, `verify-compile-results`, `plan-run`, `verify-run-plan`, `run-one`, `run`, and `verify-run-results`.
+- `run.py`: loads compiled shared objects with `ctypes`, launches kernels, checks `(H, tau)`, writes run-result manifests, and can write checker-free launcher timing records via `time-one`.
+- `cli.py`: exposes `baseline`, `probe`, `summary`, `render`, `verify-renders`, `plan-compile`, `verify-compile-plan`, `compile-one`, `compile`, `verify-compile-results`, `plan-run`, `verify-run-plan`, `run-one`, `run`, `time-one`, and `verify-run-results`.
 
 Current render candidates:
 
@@ -68,7 +68,8 @@ Current render candidates:
 - `parallel_profile`: `qr_v2_geqr2_parallel_profile_tpb256_tile32`, template `cuda_geqr2_parallel_profile_v1`. Same math as `parallel`, with device-side `clock64()` phase counters for non-admin profiling.
 - `semantic_upper`: `qr_v2_semantic_upper_fallback_tpb256_tile32`, template `cuda_semantic_upper_fallback_v1`. Routes approximate-upper matrices to `tau=0`, `H=triu(A)`, otherwise falls back to cooperative GEQR2.
 - `semantic_early_stop`: `qr_v2_semantic_early_stop_fallback_tpb256_tile32`, template `cuda_semantic_early_stop_fallback_v1`. Routes a narrow `n=512` near-collinear certificate to a 16-reflector early stop, otherwise falls back to cooperative GEQR2.
-- `semantic_combo`: `qr_v2_semantic_combo_fallback_tpb256_tile32`, template `cuda_semantic_combo_fallback_v1`. Combined upper shortcut, near-collinear early stop, and cooperative GEQR2 fallback. This is the current best semantic prototype.
+- `semantic_combo`: `qr_v2_semantic_combo_fallback_tpb256_tile32`, template `cuda_semantic_combo_fallback_v1`. Combined upper shortcut, near-collinear early stop, clustered early stop, exact zero-tail pruning, route counters, and cooperative GEQR2 fallback. This is the current best semantic prototype.
+- `cusolver`: `qr_v2_cusolver_geqrf_tpb256`, template `cuda_cusolver_geqrf_v1`. Host cuSOLVER dense GEQRF baseline/fallback with row-major/column-major packing kernels. It links against Flox-provided CUDA 13.0 `libcusolver` and `libcublas` packages when available, with a `.venv` CUDA-wheel fallback for older local environments.
 
 Rendering a suite writes `data/qr_v2/renders/<suite>/manifest.jsonl`. That manifest points at the most recently rendered candidate for that suite, while artifacts live under candidate-specific subdirectories.
 
@@ -178,16 +179,43 @@ semantic_combo:
     upper n=4096:       semantic_combo 20.62 ms vs parallel 34.96 ms
 ```
 
-These are real semantic wins, but they mostly do not hit the official benchmark distribution. The benchmark list in `docs/task.md` does not include the standalone `upper n=4096` or `nearcollinear n=512` cases. A lightweight benchmark-suite route probe showed the current `semantic_combo` routes trigger on zero benchmark matrices:
+These early semantic wins mostly did not hit the official benchmark distribution: the benchmark list in `docs/task.md` does not include standalone `upper n=4096` or `nearcollinear n=512`. Later H100 passes added an exact zero-tail route for the official rank-deficient structure, a conservative clustered `k=n/2` early-stop route, and device-side route counters (`upper_count`, `early_stop_count`, `zero_tail_count`, `fallback_count`) to run records via a `_launch_routes` entry point.
+
+The zero-tail route detects an exact trailing quarter of zero columns for `n=512` and `n=1024`, caps reflector generation at `3*n/4`, and skips trailing updates into the zero tail. Validation on H100 `sm_90`:
 
 ```text
-upper route: 0 benchmark matrices
-early-stop route: 0 benchmark matrices
+tests dense n=32/176/352: passed, fallback_count=batch
+tests rankdef n=512, batch=16: passed, zero_tail_count=16
+benchmarks rankdef n=512, batch=640: passed, zero_tail_count=640
+benchmarks clustered n=512, batch=640: passed, early_stop_count=640
+benchmarks mixed n=512, batch=640: passed, early_stop_count=57, zero_tail_count=51, fallback_count=532
+benchmarks mixed n=1024, batch=60: passed, zero_tail_count=4, fallback_count=56
 ```
 
-Therefore the current candidate is useful evidence and a correctness foothold, but it is not plausibly in the public B200 leaderboard range yet. The dense benchmark cases still fall back to the one-block cooperative GEQR2 kernel, which is far too slow for a ~2-4 ms geometric mean.
+`time-one` was added to record checker-free launcher timing on pre-generated inputs. It loads the `.so` once, warms up, repeats the launcher, and can collect route counts with a separate route-counter launch. H100 timing snapshots for `semantic_combo`:
 
-Final checks passed after the H100 semantic work:
+```text
+benchmarks rankdef n=512, batch=640:   launcher p50 2,561,842 us, zero_tail_count=640
+benchmarks clustered n=512, batch=640: launcher p50 3,671,123 us, early_stop_count=640
+benchmarks mixed n=512, batch=640:     launcher p50 3,744,751 us, early_stop_count=57, zero_tail_count=51
+benchmarks mixed n=1024, batch=60:     launcher p50 1,739,834 us, zero_tail_count=4
+```
+
+The older `run.py` `elapsed_ms` records include input generation, dynamic loading, kernel launch, and the checker, so they are useful for local regression tracking but not pure launcher timing. The current semantic candidate is now benchmark-relevant evidence, but it is still not plausibly in the public B200 leaderboard range by itself. Dense benchmark cases and most mixed matrices still fall back to the one-block cooperative GEQR2 kernel, which is far too slow for a ~2 ms geometric mean.
+
+A dense cuSOLVER candidate was added next as a correctness fallback and benchmark-relevant baseline. FloxHub packages `flox-cuda/cudaPackages_13_0.libcusolver@12.0.4.66` and `flox-cuda/cudaPackages_13_0.libcublas@13.1.1.3` are now installed in the Flox manifest; `compile_plan.py` prefers `.flox/run/x86_64-linux.gpumode.dev/include` and `.flox/run/x86_64-linux.gpumode.dev/lib` for cuSOLVER artifacts. The first-three official `tests` rows and first-four dense `benchmarks` rows passed on H100 `sm_90` with the Flox-linked build. Checker-free timing for the first four dense benchmark rows:
+
+```text
+benchmarks dense n=32,  batch=20:  launcher p50 1,605.945 us
+benchmarks dense n=176, batch=40:  launcher p50 17,980.749 us
+benchmarks dense n=352, batch=40:  launcher p50 42,420.372 us
+benchmarks dense n=512, batch=640: launcher p50 1,003,052.783 us
+first-four dense geomean: 33,293.479 us
+```
+
+This is useful as a dense fallback and a reference implementation, but it is not a leaderboard path by itself. The current launcher loops over matrices and calls host cuSOLVER once per matrix, so batch-heavy n=512 is dominated by library/launch overhead. The next dense path needs cuSolverDx, a real batched interface, or a custom tiled/multi-block QR path.
+
+Final checks passed after the H100 semantic and cuSOLVER work:
 
 ```sh
 flox activate -- uv run ruff check .
@@ -197,29 +225,29 @@ flox activate -- git diff --check
 
 ## Alignment With Proposal And Plan
 
-`docs/proposal.md` and `docs/plan.md` describe the larger strategy: build a semantic work-reduction tournament, not just a faster fixed QR kernel. The repo is now aligned with the early infrastructure and semantic-feasibility parts of that plan: deterministic input generation, checker, candidate rendering, compile/run manifests, result records, native CUDA candidates, device-side profile summaries, and a semantic probe table. It is still missing the later tournament architecture: no PyTorch extension API, no cuSOLVER/cuSolverDx fallback, no candidate registry, no frozen dispatch system, and no benchmark-relevant dense backend.
+`docs/proposal.md` and `docs/plan.md` describe the larger strategy: build a semantic work-reduction tournament, not just a faster fixed QR kernel. The repo is now aligned with the early infrastructure and semantic-feasibility parts of that plan: deterministic input generation, checker, candidate rendering, compile/run manifests, result records, native CUDA candidates, device-side profile summaries, a semantic probe table, and a local cuSOLVER dense fallback. It is still missing the later tournament architecture: no PyTorch extension API, no candidate registry, no frozen dispatch system, and no competitive dense backend.
 
-Treat the current `semantic_combo` candidate as a proof that semantic routing can pass the checker, not as a leaderboard-ready implementation.
+Treat the current `semantic_combo` and `cusolver` candidates as benchmark-relevant proof points, not as leaderboard-ready implementations.
 
 ## Next Steps
 
 Stay on H100 for more development. Use B200 only after there is a benchmark-relevant candidate worth timing. The next H100 work should target the actual benchmark set from `docs/task.md`:
 
-1. Add benchmark-relevant semantic routes:
-   - `rankdef n=512, batch=640`: exact zero-tail/zero-column route that skips the last 128 reflectors and avoids dead trailing work.
-   - `clustered n=512, batch=640`: early-stop or low-rank route around `k=256`; current probe suggests only moderate upside but it is in the benchmark set.
-   - `mixed n=512/1024`: per-matrix routing and compaction; whole-batch routing is invalid because the batch is heterogeneous.
+1. Extend benchmark-relevant semantic routes:
+   - Keep the conservative clustered `k=256` route enabled for `clustered n=512, batch=640`; it now passes, but the timing gain is modest because one-block GEQR2 remains the core cost.
+   - `mixed n=512/1024`: per-matrix routing and compaction; whole-batch routing is invalid because the batch is heterogeneous. Current route counters show 57/640 clustered early-stop matrices plus 51/640 zero-tail matrices for n=512, and 4/60 zero-tail matrices for n=1024.
    - `nearrank n=1024, batch=60`: add a lighter feasibility probe and route if stop/slack is real.
+   - Keep exact zero-tail pruning enabled for `rankdef n=512, batch=640`; it now passes the benchmark row and reports `zero_tail_count=640`.
 
-2. Add a real dense backend path:
-   - Current one-block GEQR2 is still the limiting path for dense `512/1024/2048/4096`.
-   - Evaluate cuSOLVER/cuSolverDx availability first, then consider tiled or multi-block QR.
-   - The profiler already showed dot/update dominance, so a dense custom path must address trailing updates and reflector dots, not just norm reductions.
+2. Turn the dense fallback into a competitive dense path:
+   - `cusolver` is now available and validated as a dense fallback, but the host loop over one cuSOLVER call per matrix is too slow for batch-heavy rows.
+   - Next evaluate cuSolverDx or another device-side/batched path so n=512 batch=640 does not pay hundreds of host-library launches.
+   - If a custom dense path is needed, the profiler already showed dot/update dominance, so it must address trailing updates and reflector dots, not just norm reductions.
 
 3. Improve benchmark estimation before B200:
    - Run lightweight benchmark probes by default; the full `benchmarks` probe with SVD/early-stop enabled is too heavy because `batch=640, n=512` SVD dominates.
-   - Add candidate-level route counters (`upper_count`, `early_stop_count`, `zero_tail_count`, `fallback_count`) to run records so benchmark estimates do not depend on offline inference.
-   - Once routes hit benchmark cases, run a H100 benchmark slice and compute a local geometric mean.
+   - Use `qr-v2 time-one` for selected benchmark rows; current `run.py` elapsed time includes checker and setup overhead.
+   - Once more routes hit benchmark cases, run a H100 benchmark slice and compute a local geometric mean.
 
 Switch to B200 when one of these is true:
 

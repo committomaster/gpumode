@@ -76,6 +76,30 @@ SEMANTIC_COMBO_KERNEL_CONFIG = QrV2KernelConfig(
     unroll=1,
 )
 
+CUSOLVER_KERNEL_CONFIG = QrV2KernelConfig(
+    candidate_id="qr_v2_cusolver_geqrf_tpb256",
+    template_id="cuda_cusolver_geqrf_v1",
+    threads_per_block=256,
+    tile_size=32,
+    unroll=1,
+)
+
+CUBLAS_BATCHED_KERNEL_CONFIG = QrV2KernelConfig(
+    candidate_id="qr_v2_cublas_batched_geqrf_tpb256",
+    template_id="cuda_cublas_batched_geqrf_v1",
+    threads_per_block=256,
+    tile_size=32,
+    unroll=1,
+)
+
+DENSE_LINALG_BEST_KERNEL_CONFIG = QrV2KernelConfig(
+    candidate_id="qr_v2_dense_linalg_best_tpb256",
+    template_id="cuda_dense_linalg_best_v1",
+    threads_per_block=256,
+    tile_size=32,
+    unroll=1,
+)
+
 KERNEL_CONFIGS: dict[str, QrV2KernelConfig] = {
     "serial": SERIAL_KERNEL_CONFIG,
     "parallel": PARALLEL_KERNEL_CONFIG,
@@ -83,6 +107,9 @@ KERNEL_CONFIGS: dict[str, QrV2KernelConfig] = {
     "semantic_upper": SEMANTIC_UPPER_KERNEL_CONFIG,
     "semantic_early_stop": SEMANTIC_EARLY_STOP_KERNEL_CONFIG,
     "semantic_combo": SEMANTIC_COMBO_KERNEL_CONFIG,
+    "cusolver": CUSOLVER_KERNEL_CONFIG,
+    "cublas_batched": CUBLAS_BATCHED_KERNEL_CONFIG,
+    "dense_linalg_best": DENSE_LINALG_BEST_KERNEL_CONFIG,
 }
 DEFAULT_KERNEL_CONFIG = SERIAL_KERNEL_CONFIG
 
@@ -618,6 +645,9 @@ _CUDA_SEMANTIC_EARLY_STOP_FALLBACK_TEMPLATE = (
 _SEMANTIC_COMBO_INIT_BLOCK = """    if (tid == 0) {
         shared_shortcut = 0;
         shared_early_stop = 0;
+        shared_early_stop_k = n;
+        shared_zero_tail = 0;
+        shared_zero_tail_start = n;
     }
     __syncthreads();
 
@@ -675,7 +705,36 @@ _SEMANTIC_COMBO_INIT_BLOCK = """    if (tid == 0) {
         for (int k = tid; k < n; k += blockDim.x) {
             tau[tau_offset + k] = 0.0f;
         }
+        __syncthreads();
+        if (tid == 0 && route_counts != nullptr && route_count >= QR_V2_ROUTE_FIELD_COUNT) {
+            atomicAdd(&route_counts[QR_V2_ROUTE_UPPER_COUNT], 1ULL);
+        }
         return;
+    }
+
+    if (n == 512 || n == 1024) {
+        const int candidate_zero_tail_start = (3 * n) / 4;
+        const int tail_columns = n - candidate_zero_tail_start;
+        double local_tail_l1 = 0.0;
+        for (int idx = tid; idx < n * tail_columns; idx += blockDim.x) {
+            const int row = idx / tail_columns;
+            const int tail_col = candidate_zero_tail_start + (idx - row * tail_columns);
+            local_tail_l1 += fabs(static_cast<double>(a[matrix_offset + row * n + tail_col]));
+        }
+
+        reduce_buffer[tid] = local_tail_l1;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buffer[tid] += reduce_buffer[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0 && reduce_buffer[0] == 0.0) {
+            shared_zero_tail = 1;
+            shared_zero_tail_start = candidate_zero_tail_start;
+        }
+        __syncthreads();
     }
 
     if (n == 512) {
@@ -756,7 +815,13 @@ _SEMANTIC_COMBO_INIT_BLOCK = """    if (tid == 0) {
         if (tid == 0) {
             const double column_span = shared_column_max / fmax(shared_column_min, 1.0e-30);
             const double row_span = shared_row_max / fmax(shared_row_min, 1.0e-30);
-            shared_early_stop = (column_span <= 1.05 && row_span >= 64.0) ? 1 : 0;
+            if (column_span <= 1.05 && row_span >= 64.0) {
+                shared_early_stop = 1;
+                shared_early_stop_k = 16;
+            } else if (shared_zero_tail == 0 && shared_column_min > 0.0 && column_span >= 1.0e5 && row_span <= 4.0) {
+                shared_early_stop = 1;
+                shared_early_stop_k = n / 2;
+            }
         }
         __syncthreads();
     }
@@ -768,18 +833,96 @@ _SEMANTIC_COMBO_INIT_BLOCK = """    if (tid == 0) {
         tau[tau_offset + k] = 0.0f;
     }
     __syncthreads();
+
+    if (tid == 0 && route_counts != nullptr && route_count >= QR_V2_ROUTE_FIELD_COUNT) {
+        int route_index = QR_V2_ROUTE_FALLBACK_COUNT;
+        if (shared_early_stop != 0) {
+            route_index = QR_V2_ROUTE_EARLY_STOP_COUNT;
+        } else if (shared_zero_tail != 0) {
+            route_index = QR_V2_ROUTE_ZERO_TAIL_COUNT;
+        }
+        atomicAdd(&route_counts[route_index], 1ULL);
+    }
+    __syncthreads();
+"""
+
+_SEMANTIC_ROUTE_COUNTER_DEFS = """static constexpr int QR_V2_ROUTE_FIELD_COUNT = 4;
+static constexpr int QR_V2_ROUTE_UPPER_COUNT = 0;
+static constexpr int QR_V2_ROUTE_EARLY_STOP_COUNT = 1;
+static constexpr int QR_V2_ROUTE_ZERO_TAIL_COUNT = 2;
+static constexpr int QR_V2_ROUTE_FALLBACK_COUNT = 3;
+
+"""
+
+_SEMANTIC_ROUTE_COUNTER_LAUNCHER = """
+extern "C" __attribute__((visibility("default"))) int {{ config.entry_point }}_launch_routes(
+    const float* a,
+    float* h,
+    float* tau,
+    unsigned long long* route_counts,
+    int batch,
+    int n,
+    int threads_per_block,
+    int route_count
+) {
+    if (a == nullptr || h == nullptr || tau == nullptr || route_counts == nullptr || batch <= 0 || n <= 0 || threads_per_block <= 0) {
+        return -1;
+    }
+    if (threads_per_block > 1024 || (threads_per_block & (threads_per_block - 1)) != 0) {
+        return -2;
+    }
+    if (route_count < QR_V2_ROUTE_FIELD_COUNT) {
+        return -3;
+    }
+
+    cudaError_t memset_status = cudaMemset(route_counts, 0, sizeof(unsigned long long) * route_count);
+    if (memset_status != cudaSuccess) {
+        return static_cast<int>(memset_status);
+    }
+
+    {{ config.entry_point }}<<<batch, threads_per_block>>>(a, h, tau, route_counts, route_count, batch, n);
+    cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+        return static_cast<int>(launch_status);
+    }
+
+    cudaError_t sync_status = cudaDeviceSynchronize();
+    if (sync_status != cudaSuccess) {
+        return static_cast<int>(sync_status);
+    }
+    return 0;
+}
 """
 
 _CUDA_SEMANTIC_COMBO_FALLBACK_TEMPLATE = (
     _CUDA_GEQR2_PARALLEL_TEMPLATE.replace(
         "Correct-first cooperative GEQR2 implementation with block reductions.",
-        "Upper shortcut and near-collinear early-stop routes with cooperative GEQR2 fallback.",
+        "Upper, near-collinear/clustered early-stop, and zero-tail routes with cooperative GEQR2 fallback.",
+    )
+    .replace(
+        "#include <math.h>\n\n",
+        "#include <math.h>\n\n" + _SEMANTIC_ROUTE_COUNTER_DEFS,
+        1,
+    )
+    .replace(
+        """    int batch,
+    int n
+) {""",
+        """    unsigned long long* __restrict__ route_counts,
+    int route_count,
+    int batch,
+    int n
+) {""",
+        1,
     )
     .replace(
         "__shared__ int shared_active;\n\n    const int matrix_offset",
         "__shared__ int shared_active;\n"
         "    __shared__ int shared_shortcut;\n"
         "    __shared__ int shared_early_stop;\n"
+        "    __shared__ int shared_early_stop_k;\n"
+        "    __shared__ int shared_zero_tail;\n"
+        "    __shared__ int shared_zero_tail_start;\n"
         "    __shared__ double shared_norm1;\n"
         "    __shared__ double shared_strictlower_norm1;\n"
         "    __shared__ double shared_column_min;\n"
@@ -802,9 +945,22 @@ _CUDA_SEMANTIC_COMBO_FALLBACK_TEMPLATE = (
     )
     .replace(
         "    for (int k = 0; k < n; ++k) {",
-        "    const int qr_stop_k = shared_early_stop != 0 ? 16 : n;\n\n    for (int k = 0; k < qr_stop_k; ++k) {",
+        "    const int qr_stop_k = shared_early_stop != 0 ? shared_early_stop_k : shared_zero_tail_start;\n"
+        "    const int qr_col_stop = shared_zero_tail != 0 ? shared_zero_tail_start : n;\n\n"
+        "    for (int k = 0; k < qr_stop_k; ++k) {",
         1,
     )
+    .replace(
+        "        for (int col = k + 1; col < n; ++col) {",
+        "        for (int col = k + 1; col < qr_col_stop; ++col) {",
+        1,
+    )
+    .replace(
+        "    {{ config.entry_point }}<<<batch, threads_per_block>>>(a, h, tau, batch, n);",
+        "    {{ config.entry_point }}<<<batch, threads_per_block>>>(a, h, tau, nullptr, 0, batch, n);",
+        1,
+    )
+    + _SEMANTIC_ROUTE_COUNTER_LAUNCHER
 )
 
 _CUDA_GEQR2_PARALLEL_PROFILE_TEMPLATE = """// Generated by gpumode.qr_v2 {{ renderer_version }}.
@@ -1093,6 +1249,366 @@ extern "C" __attribute__((visibility("default"))) int {{ config.entry_point }}_l
 }
 """
 
+
+_CUDA_CUSOLVER_GEQRF_TEMPLATE = """// Generated by gpumode.qr_v2 {{ renderer_version }}.
+// cuSOLVER dense GEQRF baseline with row-major/column-major packing kernels.
+//
+// candidate_id: {{ config.candidate_id }}
+// template_id: {{ config.template_id }}
+// entry_point: {{ config.entry_point }}
+// eval: {{ spec.eval_line(include_dense_case=True) }}
+// shape: batch={{ spec.batch }}, n={{ spec.n }}, cond={{ spec.cond }}, case={{ spec.case }}, seed={{ spec.seed }}
+// sweep: threads_per_block={{ config.threads_per_block }}, tile_size={{ config.tile_size }}, unroll={{ config.unroll }}
+
+#include <cuda_runtime.h>
+#include <cusolverDn.h>
+
+#include <vector>
+
+extern "C" __global__ void {{ config.entry_point }}_row_to_col_major(
+    const float* __restrict__ a,
+    float* __restrict__ packed,
+    int batch,
+    int n
+) {
+    const int total = batch * n * n;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
+        const int matrix_size = n * n;
+        const int matrix_idx = idx / matrix_size;
+        const int offset = idx - matrix_idx * matrix_size;
+        const int row = offset / n;
+        const int col = offset - row * n;
+        packed[matrix_idx * matrix_size + row + col * n] = a[matrix_idx * matrix_size + row * n + col];
+    }
+}
+
+extern "C" __global__ void {{ config.entry_point }}_col_to_row_major(
+    const float* __restrict__ packed,
+    float* __restrict__ h,
+    int batch,
+    int n
+) {
+    const int total = batch * n * n;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
+        const int matrix_size = n * n;
+        const int matrix_idx = idx / matrix_size;
+        const int offset = idx - matrix_idx * matrix_size;
+        const int row = offset / n;
+        const int col = offset - row * n;
+        h[matrix_idx * matrix_size + row * n + col] = packed[matrix_idx * matrix_size + row + col * n];
+    }
+}
+
+extern "C" __attribute__((visibility("default"))) int {{ config.entry_point }}_launch(
+    const float* a,
+    float* h,
+    float* tau,
+    int batch,
+    int n,
+    int threads_per_block
+) {
+    if (a == nullptr || h == nullptr || tau == nullptr || batch <= 0 || n <= 0 || threads_per_block <= 0) {
+        return -1;
+    }
+    if (threads_per_block > 1024 || (threads_per_block & (threads_per_block - 1)) != 0) {
+        return -2;
+    }
+
+    cusolverDnHandle_t handle = nullptr;
+    float* packed = nullptr;
+    float* workspace = nullptr;
+    int* info = nullptr;
+
+    auto cleanup = [&]() {
+        if (info != nullptr) {
+            cudaFree(info);
+        }
+        if (workspace != nullptr) {
+            cudaFree(workspace);
+        }
+        if (packed != nullptr) {
+            cudaFree(packed);
+        }
+        if (handle != nullptr) {
+            cusolverDnDestroy(handle);
+        }
+    };
+
+    cusolverStatus_t solver_status = cusolverDnCreate(&handle);
+    if (solver_status != CUSOLVER_STATUS_SUCCESS) {
+        cleanup();
+        return 10000 + static_cast<int>(solver_status);
+    }
+
+    const size_t matrix_size = static_cast<size_t>(n) * static_cast<size_t>(n);
+    const size_t value_count = static_cast<size_t>(batch) * matrix_size;
+    cudaError_t cuda_status = cudaMalloc(&packed, value_count * sizeof(float));
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+
+    const int max_blocks = 65535;
+    int blocks = static_cast<int>((value_count + static_cast<size_t>(threads_per_block) - 1) / static_cast<size_t>(threads_per_block));
+    if (blocks < 1) {
+        blocks = 1;
+    }
+    if (blocks > max_blocks) {
+        blocks = max_blocks;
+    }
+
+    {{ config.entry_point }}_row_to_col_major<<<blocks, threads_per_block>>>(a, packed, batch, n);
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+
+    int lwork = 0;
+    solver_status = cusolverDnSgeqrf_bufferSize(handle, n, n, packed, n, &lwork);
+    if (solver_status != CUSOLVER_STATUS_SUCCESS || lwork <= 0) {
+        cleanup();
+        return 11000 + static_cast<int>(solver_status);
+    }
+
+    cuda_status = cudaMalloc(&workspace, static_cast<size_t>(lwork) * sizeof(float));
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+    cuda_status = cudaMalloc(&info, static_cast<size_t>(batch) * sizeof(int));
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+
+    for (int matrix_idx = 0; matrix_idx < batch; ++matrix_idx) {
+        float* matrix = packed + static_cast<size_t>(matrix_idx) * matrix_size;
+        float* tau_matrix = tau + static_cast<size_t>(matrix_idx) * static_cast<size_t>(n);
+        solver_status = cusolverDnSgeqrf(handle, n, n, matrix, n, tau_matrix, workspace, lwork, info + matrix_idx);
+        if (solver_status != CUSOLVER_STATUS_SUCCESS) {
+            cleanup();
+            return 12000 + static_cast<int>(solver_status);
+        }
+    }
+
+    {{ config.entry_point }}_col_to_row_major<<<blocks, threads_per_block>>>(packed, h, batch, n);
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+
+    cuda_status = cudaDeviceSynchronize();
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+
+    std::vector<int> host_info(static_cast<size_t>(batch), 0);
+    cuda_status = cudaMemcpy(host_info.data(), info, static_cast<size_t>(batch) * sizeof(int), cudaMemcpyDeviceToHost);
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+    for (int matrix_idx = 0; matrix_idx < batch; ++matrix_idx) {
+        if (host_info[static_cast<size_t>(matrix_idx)] != 0) {
+            cleanup();
+            return -1000 - matrix_idx;
+        }
+    }
+
+    cleanup();
+    return 0;
+}
+"""
+
+
+_CUDA_CUBLAS_BATCHED_GEQRF_TEMPLATE = """// Generated by gpumode.qr_v2 {{ renderer_version }}.
+// cuBLAS batched dense GEQRF baseline with row-major/column-major packing kernels.
+//
+// candidate_id: {{ config.candidate_id }}
+// template_id: {{ config.template_id }}
+// entry_point: {{ config.entry_point }}
+// eval: {{ spec.eval_line(include_dense_case=True) }}
+// shape: batch={{ spec.batch }}, n={{ spec.n }}, cond={{ spec.cond }}, case={{ spec.case }}, seed={{ spec.seed }}
+// sweep: threads_per_block={{ config.threads_per_block }}, tile_size={{ config.tile_size }}, unroll={{ config.unroll }}
+
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
+#include <vector>
+
+extern "C" __global__ void {{ config.entry_point }}_row_to_col_major(
+    const float* __restrict__ a,
+    float* __restrict__ packed,
+    int batch,
+    int n
+) {
+    const int total = batch * n * n;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
+        const int matrix_size = n * n;
+        const int matrix_idx = idx / matrix_size;
+        const int offset = idx - matrix_idx * matrix_size;
+        const int row = offset / n;
+        const int col = offset - row * n;
+        packed[matrix_idx * matrix_size + row + col * n] = a[matrix_idx * matrix_size + row * n + col];
+    }
+}
+
+extern "C" __global__ void {{ config.entry_point }}_col_to_row_major(
+    const float* __restrict__ packed,
+    float* __restrict__ h,
+    int batch,
+    int n
+) {
+    const int total = batch * n * n;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
+        const int matrix_size = n * n;
+        const int matrix_idx = idx / matrix_size;
+        const int offset = idx - matrix_idx * matrix_size;
+        const int row = offset / n;
+        const int col = offset - row * n;
+        h[matrix_idx * matrix_size + row * n + col] = packed[matrix_idx * matrix_size + row + col * n];
+    }
+}
+
+extern "C" __global__ void {{ config.entry_point }}_init_pointer_arrays(
+    float* __restrict__ packed,
+    float* __restrict__ tau,
+    float** __restrict__ matrix_ptrs,
+    float** __restrict__ tau_ptrs,
+    int batch,
+    int n
+) {
+    const int matrix_size = n * n;
+    for (int matrix_idx = blockIdx.x * blockDim.x + threadIdx.x; matrix_idx < batch; matrix_idx += blockDim.x * gridDim.x) {
+        matrix_ptrs[matrix_idx] = packed + static_cast<size_t>(matrix_idx) * static_cast<size_t>(matrix_size);
+        tau_ptrs[matrix_idx] = tau + static_cast<size_t>(matrix_idx) * static_cast<size_t>(n);
+    }
+}
+
+extern "C" __attribute__((visibility("default"))) int {{ config.entry_point }}_launch(
+    const float* a,
+    float* h,
+    float* tau,
+    int batch,
+    int n,
+    int threads_per_block
+) {
+    if (a == nullptr || h == nullptr || tau == nullptr || batch <= 0 || n <= 0 || threads_per_block <= 0) {
+        return -1;
+    }
+    if (threads_per_block > 1024 || (threads_per_block & (threads_per_block - 1)) != 0) {
+        return -2;
+    }
+
+    cublasHandle_t handle = nullptr;
+    float* packed = nullptr;
+    float** matrix_ptrs = nullptr;
+    float** tau_ptrs = nullptr;
+
+    auto cleanup = [&]() {
+        if (tau_ptrs != nullptr) {
+            cudaFree(tau_ptrs);
+        }
+        if (matrix_ptrs != nullptr) {
+            cudaFree(matrix_ptrs);
+        }
+        if (packed != nullptr) {
+            cudaFree(packed);
+        }
+        if (handle != nullptr) {
+            cublasDestroy(handle);
+        }
+    };
+
+    cublasStatus_t cublas_status = cublasCreate(&handle);
+    if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return 10000 + static_cast<int>(cublas_status);
+    }
+
+    const size_t matrix_size = static_cast<size_t>(n) * static_cast<size_t>(n);
+    const size_t value_count = static_cast<size_t>(batch) * matrix_size;
+    cudaError_t cuda_status = cudaMalloc(&packed, value_count * sizeof(float));
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+    cuda_status = cudaMalloc(&matrix_ptrs, static_cast<size_t>(batch) * sizeof(float*));
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+    cuda_status = cudaMalloc(&tau_ptrs, static_cast<size_t>(batch) * sizeof(float*));
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+
+    const int max_blocks = 65535;
+    int blocks = static_cast<int>((value_count + static_cast<size_t>(threads_per_block) - 1) / static_cast<size_t>(threads_per_block));
+    if (blocks < 1) {
+        blocks = 1;
+    }
+    if (blocks > max_blocks) {
+        blocks = max_blocks;
+    }
+
+    {{ config.entry_point }}_row_to_col_major<<<blocks, threads_per_block>>>(a, packed, batch, n);
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+
+    int pointer_blocks = (batch + threads_per_block - 1) / threads_per_block;
+    if (pointer_blocks < 1) {
+        pointer_blocks = 1;
+    }
+    if (pointer_blocks > max_blocks) {
+        pointer_blocks = max_blocks;
+    }
+    {{ config.entry_point }}_init_pointer_arrays<<<pointer_blocks, threads_per_block>>>(packed, tau, matrix_ptrs, tau_ptrs, batch, n);
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+
+    int info = 0;
+    cublas_status = cublasSgeqrfBatched(handle, n, n, matrix_ptrs, n, tau_ptrs, &info, batch);
+    if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return 11000 + static_cast<int>(cublas_status);
+    }
+
+    {{ config.entry_point }}_col_to_row_major<<<blocks, threads_per_block>>>(packed, h, batch, n);
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+
+    cuda_status = cudaDeviceSynchronize();
+    if (cuda_status != cudaSuccess) {
+        cleanup();
+        return static_cast<int>(cuda_status);
+    }
+
+    if (info != 0) {
+        cleanup();
+        return -1000 + info;
+    }
+
+    cleanup();
+    return 0;
+}
+"""
+
+_CUDA_DENSE_LINALG_BEST_TEMPLATE = """{% if spec.n == 32 or spec.n == 176 or spec.n == 512 %}""" + _CUDA_CUBLAS_BATCHED_GEQRF_TEMPLATE + """{% else %}""" + _CUDA_CUSOLVER_GEQRF_TEMPLATE + """{% endif %}"""
+
 _CUDA_TEMPLATES = {
     "cuda_geqr2_serial_v1": _CUDA_GEQR2_SERIAL_TEMPLATE,
     "cuda_geqr2_parallel_v1": _CUDA_GEQR2_PARALLEL_TEMPLATE,
@@ -1100,6 +1616,9 @@ _CUDA_TEMPLATES = {
     "cuda_semantic_upper_fallback_v1": _CUDA_SEMANTIC_UPPER_FALLBACK_TEMPLATE,
     "cuda_semantic_early_stop_fallback_v1": _CUDA_SEMANTIC_EARLY_STOP_FALLBACK_TEMPLATE,
     "cuda_semantic_combo_fallback_v1": _CUDA_SEMANTIC_COMBO_FALLBACK_TEMPLATE,
+    "cuda_cusolver_geqrf_v1": _CUDA_CUSOLVER_GEQRF_TEMPLATE,
+    "cuda_cublas_batched_geqrf_v1": _CUDA_CUBLAS_BATCHED_GEQRF_TEMPLATE,
+    "cuda_dense_linalg_best_v1": _CUDA_DENSE_LINALG_BEST_TEMPLATE,
 }
 
 _JINJA_ENV = Environment(

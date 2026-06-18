@@ -3,8 +3,10 @@ schema-version = "1.12.0"
 
 [install]
 age = { pkg-path = "age", version = "1.3.1" }
+cuda_cublas = { pkg-path = "flox-cuda/cudaPackages_13_0.libcublas", version = "13.1.1.3", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 16 }
 cuda_cccl = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_cccl", version = "13.0.85", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 7 }
 cuda_cudart = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_cudart", version = "13.0.96", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 6 }
+cuda_cusolver = { pkg-path = "flox-cuda/cudaPackages_13_0.libcusolver", version = "12.0.4.66", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 17 }
 cuda_cuobjdump = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_cuobjdump", version = "13.0.85", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 11 }
 cuda_cupti = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_cupti", version = "13.0.85", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 9 }
 cuda_gdb = { pkg-path = "flox-cuda/cudaPackages_13_0.cuda_gdb", version = "13.0.85", systems = ["x86_64-linux"], pkg-group = "cuda13", priority = 8 }

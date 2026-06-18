@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,10 @@ from gpumode.qr_v2.jsonl import write_jsonl
 
 
 COMPILE_PLAN_VERSION = "compile_plan_v1"
+CUSOLVER_TEMPLATE_IDS = frozenset({"cuda_cusolver_geqrf_v1"})
+CUBLAS_TEMPLATE_IDS = frozenset({"cuda_cublas_batched_geqrf_v1"})
+DENSE_LINALG_TEMPLATE_IDS = frozenset({"cuda_dense_linalg_best_v1"})
+CUDA_LINALG_TEMPLATE_IDS = CUSOLVER_TEMPLATE_IDS | CUBLAS_TEMPLATE_IDS | DENSE_LINALG_TEMPLATE_IDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,8 +94,8 @@ def _compile_output_path(*, suite: str, candidate_id: str, artifact_path: str, o
     return output_root / suite / candidate_id / stem
 
 
-def _compile_argv(*, artifact_path: str, output_path: Path, gpu_arch: str) -> list[str]:
-    return [
+def _compile_argv(*, artifact_path: str, output_path: Path, gpu_arch: str, template_id: str) -> list[str]:
+    argv = [
         "nvcc",
         f"-arch={gpu_arch}",
         "--shared",
@@ -102,6 +107,40 @@ def _compile_argv(*, artifact_path: str, output_path: Path, gpu_arch: str) -> li
         output_path.as_posix(),
         artifact_path,
     ]
+    if template_id in CUDA_LINALG_TEMPLATE_IDS:
+        uses_cusolver = template_id in CUSOLVER_TEMPLATE_IDS or template_id in DENSE_LINALG_TEMPLATE_IDS
+        required_header = "cusolverDn.h" if uses_cusolver else "cublas_v2.h"
+        required_library = "libcusolver.so.12" if uses_cusolver else "libcublas.so.13"
+        link_libraries = ["-l:libcusolver.so.12", "-l:libcublas.so.13"] if uses_cusolver else ["-l:libcublas.so.13"]
+
+        flox_cuda_root = Path(".flox") / "run" / "x86_64-linux.gpumode.dev"
+        include_root = flox_cuda_root / "include"
+        cuda_lib_root = flox_cuda_root / "lib"
+        cuda_rpath = "$ORIGIN/../../../../../.flox/run/x86_64-linux.gpumode.dev/lib"
+
+        flox_env = os.environ.get("FLOX_ENV")
+        if not (include_root / required_header).exists() and flox_env:
+            env_cuda_root = Path(flox_env)
+            include_root = env_cuda_root / "include"
+            cuda_lib_root = env_cuda_root / "lib"
+            cuda_rpath = cuda_lib_root.as_posix()
+
+        if not (include_root / required_header).exists() or not (cuda_lib_root / required_library).exists():
+            cuda_package_root = Path(".venv") / "lib" / "python3.13" / "site-packages" / "nvidia" / "cu13"
+            include_root = cuda_package_root / "include"
+            cuda_lib_root = cuda_package_root / "lib"
+            cuda_rpath = "$ORIGIN/../../../../../.venv/lib/python3.13/site-packages/nvidia/cu13/lib"
+
+        argv.extend([
+            f"-I{include_root.as_posix()}",
+            f"-L{cuda_lib_root.as_posix()}",
+            *link_libraries,
+            "-Xlinker",
+            "-rpath",
+            "-Xlinker",
+            cuda_rpath,
+        ])
+    return argv
 
 
 def _sha256_bytes(content: bytes) -> str:
@@ -130,6 +169,8 @@ def plan_compile_from_render_manifest(
             output_root=output_root,
         )
 
+        template_id = _required_string(render_record, "template_id")
+
         records.append(
             {
                 "event": "compile_plan",
@@ -145,6 +186,7 @@ def plan_compile_from_render_manifest(
                     artifact_path=artifact_path,
                     output_path=output_path,
                     gpu_arch=gpu_arch,
+                    template_id=template_id,
                 ),
                 "output_kind": "cuda_shared_object",
                 "output_path": output_path.as_posix(),
@@ -153,7 +195,7 @@ def plan_compile_from_render_manifest(
                 "source_bytes": _required_int(render_record, "artifact_bytes"),
                 "source_sha256": _required_string(render_record, "artifact_sha256"),
                 "candidate_id": candidate_id,
-                "template_id": _required_string(render_record, "template_id"),
+                "template_id": template_id,
                 "entry_point": _required_string(render_record, "entry_point"),
                 "renderer_version": _required_string(render_record, "renderer_version"),
                 "batch": _required_int(render_record, "batch"),

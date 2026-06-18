@@ -28,9 +28,12 @@ from gpumode.qr_v2.render import KERNEL_CONFIGS, RenderSuiteResult, RenderVerifi
 from gpumode.qr_v2.run import (
     RunExecutionResult,
     RunResultVerificationResult,
+    TimingExecutionResult,
     run_from_plan_manifest,
     run_one,
     run_one_from_plan_manifest,
+    time_one,
+    time_one_from_plan_manifest,
     verify_run_result_manifest,
 )
 from gpumode.qr_v2.run_plan import (
@@ -536,6 +539,101 @@ def _run_run(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _timing_result_report(result: TimingExecutionResult) -> None:
+    result_count = len(result.records)
+    ok_count = sum(1 for record in result.records if bool(record.get("ok")))
+    failed_count = result_count - ok_count
+    if not sys.stdout.isatty():
+        print(f"timed {ok_count}/{result_count} jobs")
+        print(f"manifest: {result.result_path}")
+        print(f"failed: {failed_count}")
+        if result_count == 1:
+            record = result.records[0]
+            print(f"status: {record.get('status', '')}")
+            if record.get("launcher_elapsed_us_p50") is not None:
+                print(f"launcher_us_p50: {record['launcher_elapsed_us_p50']}")
+            if record.get("timing_result_path"):
+                print(f"result: {record['timing_result_path']}")
+        return
+
+    table = Table(title="timing", show_header=False)
+    table.add_column("field", style="bold")
+    table.add_column("value")
+    table.add_row("status", "[green]pass[/green]" if result.ok else "[bold red]fail[/bold red]")
+    table.add_row("manifest", result.result_path.as_posix())
+    table.add_row("jobs", str(result_count))
+    table.add_row("completed", str(ok_count))
+    table.add_row("failed", str(failed_count))
+    if result_count == 1:
+        record = result.records[0]
+        table.add_row("result", str(record.get("status", "")))
+        if record.get("launcher_elapsed_us_p50") is not None:
+            table.add_row("launcher_us_p50", str(record["launcher_elapsed_us_p50"]))
+        if record.get("timing_result_path"):
+            table.add_row("output", str(record["timing_result_path"]))
+    Console().print(table)
+
+
+def _run_time_one(args: argparse.Namespace) -> int:
+    result_path = None if args.out is None else _data_output_path(args.out, suite=args.suite, kind="timing-results")
+
+    if args.compiled_artifact is not None:
+        missing = [
+            name
+            for name in ("entry_point", "batch", "n", "cond", "seed", "case")
+            if getattr(args, name) is None
+        ]
+        if missing:
+            print(f"missing direct time-one args: {', '.join('--' + name.replace('_', '-') for name in missing)}", file=sys.stderr)
+            return 2
+        assert args.entry_point is not None
+        assert args.batch is not None
+        assert args.n is not None
+        assert args.cond is not None
+        assert args.seed is not None
+        assert args.case is not None
+        result = time_one(
+            suite=args.suite,
+            compiled_artifact_path=Path(args.compiled_artifact),
+            entry_point=args.entry_point,
+            launcher_entry_point=args.launcher_entry_point,
+            batch=args.batch,
+            n=args.n,
+            cond=args.cond,
+            seed=args.seed,
+            case=args.case,
+            threads_per_block=args.threads_per_block,
+            warmups=args.warmups,
+            repeats=args.repeats,
+            collect_route_counts=args.collect_route_counts,
+            result_path=result_path,
+            device=args.device,
+            max_snippet_chars=args.max_snippet_chars,
+        )
+    else:
+        run_plan_path = _data_directory_path(None, suite=args.suite, kind="run-plans") / "manifest.jsonl"
+        if args.run_plan is not None:
+            run_plan_path = _data_output_path(args.run_plan, suite=args.suite, kind="run-plans")
+        result = time_one_from_plan_manifest(
+            suite=args.suite,
+            run_plan_manifest_path=run_plan_path,
+            index=args.index,
+            result_path=result_path,
+            warmups=args.warmups,
+            repeats=args.repeats,
+            collect_route_counts=args.collect_route_counts,
+            device=args.device,
+            max_snippet_chars=args.max_snippet_chars,
+        )
+
+    if args.stdout:
+        for record in result.records:
+            print(dumps_record(record))
+    else:
+        _timing_result_report(result)
+    return 0 if result.ok else 1
+
+
 def _verify_run_result_report(result: RunResultVerificationResult) -> None:
     if not sys.stdout.isatty():
         print("run results ok" if result.ok else "run results failed")
@@ -834,6 +932,28 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--device", default=None)
     run_cmd.add_argument("--max-snippet-chars", type=int, default=4000)
     run_cmd.set_defaults(func=_run_run)
+
+    time_one_cmd = subparsers.add_parser("time-one", help="time one qr_v2 launcher without checker overhead")
+    time_one_cmd.add_argument("--suite", choices=("smoke", "tests", "benchmarks"), default="smoke")
+    time_one_cmd.add_argument("--run-plan", default=None)
+    time_one_cmd.add_argument("--index", type=int, default=0)
+    time_one_cmd.add_argument("--compiled-artifact", default=None)
+    time_one_cmd.add_argument("--entry-point", default=None)
+    time_one_cmd.add_argument("--launcher-entry-point", default=None)
+    time_one_cmd.add_argument("--batch", type=int, default=None)
+    time_one_cmd.add_argument("--n", type=int, default=None)
+    time_one_cmd.add_argument("--cond", type=int, default=None)
+    time_one_cmd.add_argument("--seed", type=int, default=None)
+    time_one_cmd.add_argument("--case", default=None)
+    time_one_cmd.add_argument("--threads-per-block", type=int, default=128)
+    time_one_cmd.add_argument("--warmups", type=int, default=3)
+    time_one_cmd.add_argument("--repeats", type=int, default=20)
+    time_one_cmd.add_argument("--collect-route-counts", action="store_true")
+    time_one_cmd.add_argument("--device", default=None)
+    time_one_cmd.add_argument("--out", default=None)
+    time_one_cmd.add_argument("--stdout", action="store_true")
+    time_one_cmd.add_argument("--max-snippet-chars", type=int, default=4000)
+    time_one_cmd.set_defaults(func=_run_time_one)
 
     verify_run_results = subparsers.add_parser(
         "verify-run-results",

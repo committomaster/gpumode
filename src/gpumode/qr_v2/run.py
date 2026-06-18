@@ -16,9 +16,19 @@ from gpumode.qr_v2.jsonl import write_jsonl
 
 
 RUN_RESULT_VERSION = "run_result_v1"
+TIMING_RESULT_VERSION = "timing_result_v1"
 DEFAULT_SNIPPET_CHARS = 4000
 DEFAULT_THREADS_PER_BLOCK = 128
+DEFAULT_TIMING_WARMUPS = 3
+DEFAULT_TIMING_REPEATS = 20
 PROFILE_TEMPLATE_ID = "cuda_geqr2_parallel_profile_v1"
+ROUTE_COUNTER_TEMPLATE_IDS = frozenset({"cuda_semantic_combo_fallback_v1"})
+ROUTE_COUNTER_FIELDS = (
+    "upper_count",
+    "early_stop_count",
+    "zero_tail_count",
+    "fallback_count",
+)
 PROFILE_COUNTER_FIELDS = (
     "total_cycles",
     "init_cycles",
@@ -41,6 +51,16 @@ PROFILE_PHASE_FIELDS = (
 
 @dataclass(frozen=True, slots=True)
 class RunExecutionResult:
+    result_path: Path
+    records: list[dict[str, object]]
+
+    @property
+    def ok(self) -> bool:
+        return all(bool(record.get("ok")) for record in self.records)
+
+
+@dataclass(frozen=True, slots=True)
+class TimingExecutionResult:
     result_path: Path
     records: list[dict[str, object]]
 
@@ -147,6 +167,14 @@ def _uses_device_profile(plan_record: dict[str, Any] | None, launcher_entry_poin
     return plan_record.get("template_id") == PROFILE_TEMPLATE_ID
 
 
+def _uses_route_counters(plan_record: dict[str, Any] | None, launcher_entry_point: str | None) -> bool:
+    if launcher_entry_point is not None and launcher_entry_point.endswith("_launch_routes"):
+        return True
+    if plan_record is None:
+        return False
+    return plan_record.get("template_id") in ROUTE_COUNTER_TEMPLATE_IDS
+
+
 def _profile_cycle_summary(profile: torch.Tensor) -> dict[str, object]:
     cpu_profile = profile.detach().cpu().contiguous()
     rows = [[int(value) for value in row] for row in cpu_profile.tolist()]
@@ -201,6 +229,19 @@ def _profile_cycle_summary(profile: torch.Tensor) -> dict[str, object]:
     }
 
 
+def _route_counter_summary(route_counter_tensor: torch.Tensor) -> dict[str, object]:
+    cpu_counts = route_counter_tensor.detach().cpu().contiguous()
+    counts = [int(value) for value in cpu_counts.tolist()]
+    named_counts = {field: counts[index] for index, field in enumerate(ROUTE_COUNTER_FIELDS)}
+    return {
+        "route_counter_source": "device_atomic",
+        "route_counter_field_names": list(ROUTE_COUNTER_FIELDS),
+        "route_counts": named_counts,
+        "route_total_count": int(sum(counts)),
+        **named_counts,
+    }
+
+
 def _cuda_device_index(device: str | None) -> int:
     if device is None:
         return 0
@@ -216,9 +257,20 @@ def _result_path_from_artifact(*, suite: str, compiled_artifact_path: str) -> Pa
     return Path("data") / "qr_v2" / "run-results" / suite / candidate_id / artifact.with_suffix(".jsonl").name
 
 
+def _timing_result_path_from_artifact(*, suite: str, compiled_artifact_path: str) -> Path:
+    artifact = Path(compiled_artifact_path)
+    candidate_id = artifact.parent.name if artifact.parent.name else "unknown_candidate"
+    return Path("data") / "qr_v2" / "timing-results" / suite / candidate_id / artifact.with_suffix(".jsonl").name
+
+
 def _write_result(result_path: Path, records: list[dict[str, object]]) -> RunExecutionResult:
     write_jsonl(result_path, records)
     return RunExecutionResult(result_path=result_path, records=records)
+
+
+def _write_timing_result(result_path: Path, records: list[dict[str, object]]) -> TimingExecutionResult:
+    write_jsonl(result_path, records)
+    return TimingExecutionResult(result_path=result_path, records=records)
 
 
 def _base_record(
@@ -364,9 +416,15 @@ def _run_kernel_record(
     _check_execution_path(result_path.as_posix(), field="run_result_path", prefix=("data", "qr_v2", "run-results"))
 
     collect_device_profile = _uses_device_profile(plan_record, launcher_entry_point)
-    launcher_name = launcher_entry_point or (
-        f"{entry_point}_launch_profile" if collect_device_profile else f"{entry_point}_launch"
-    )
+    collect_route_counters = _uses_route_counters(plan_record, launcher_entry_point)
+    if launcher_entry_point is not None:
+        launcher_name = launcher_entry_point
+    elif collect_device_profile:
+        launcher_name = f"{entry_point}_launch_profile"
+    elif collect_route_counters:
+        launcher_name = f"{entry_point}_launch_routes"
+    else:
+        launcher_name = f"{entry_point}_launch"
     record = _base_record(
         suite=suite,
         plan_record=plan_record,
@@ -435,6 +493,7 @@ def _run_kernel_record(
             return record
 
         profile = None
+        route_counters = None
         if collect_device_profile:
             profile = torch.zeros(
                 (batch, len(PROFILE_COUNTER_FIELDS)),
@@ -462,6 +521,35 @@ def _run_kernel_record(
                     ctypes.c_int(n),
                     ctypes.c_int(threads_per_block),
                     ctypes.c_int(len(PROFILE_COUNTER_FIELDS)),
+                )
+            )
+        elif collect_route_counters:
+            route_counters = torch.zeros(
+                (len(ROUTE_COUNTER_FIELDS),),
+                device=resolved_device,
+                dtype=torch.uint64,
+            )
+            launcher.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            launcher.restype = ctypes.c_int
+            returncode = int(
+                launcher(
+                    ctypes.c_void_p(a.data_ptr()),
+                    ctypes.c_void_p(h.data_ptr()),
+                    ctypes.c_void_p(tau.data_ptr()),
+                    ctypes.c_void_p(route_counters.data_ptr()),
+                    ctypes.c_int(batch),
+                    ctypes.c_int(n),
+                    ctypes.c_int(threads_per_block),
+                    ctypes.c_int(len(ROUTE_COUNTER_FIELDS)),
                 )
             )
         else:
@@ -496,6 +584,8 @@ def _run_kernel_record(
         )
         if returncode == 0 and profile is not None:
             record.update(_profile_cycle_summary(profile))
+        if returncode == 0 and route_counters is not None:
+            record.update(_route_counter_summary(route_counters))
         if returncode != 0:
             record.update(
                 {
@@ -531,6 +621,572 @@ def _run_kernel_record(
             }
         )
         return record
+
+
+
+def _time_base_record(
+    *,
+    suite: str,
+    plan_record: dict[str, Any] | None,
+    run_plan_manifest_path: Path | None,
+    plan_index: int,
+    result_path: Path,
+    compiled_artifact_path: str | None,
+    entry_point: str | None,
+    launcher_entry_point: str | None,
+    batch: int | None,
+    n: int | None,
+    cond: int | None,
+    seed: int | None,
+    case: str | None,
+    threads_per_block: int,
+    warmups: int,
+    repeats: int,
+    max_snippet_chars: int,
+) -> dict[str, object]:
+    record: dict[str, object] = {
+        "event": "timing_result",
+        "result_version": TIMING_RESULT_VERSION,
+        "suite": suite,
+        "plan_index": plan_index,
+        "timing_result_path": result_path.as_posix(),
+        "ok": False,
+        "status": "input_error",
+        "returncode": 1,
+        "launcher_warmups": warmups,
+        "launcher_repeats": repeats,
+        "elapsed_ns": 0,
+        "stdout_snippet": "",
+        "stderr_snippet": "",
+        "max_snippet_chars": max_snippet_chars,
+    }
+    if run_plan_manifest_path is not None:
+        record["run_plan_manifest_path"] = run_plan_manifest_path.as_posix()
+    if compiled_artifact_path is not None:
+        record["compiled_artifact_path"] = compiled_artifact_path
+    if entry_point is not None:
+        record["entry_point"] = entry_point
+    if launcher_entry_point is not None:
+        record["launcher_entry_point"] = launcher_entry_point
+    if batch is not None:
+        record["batch"] = batch
+    if n is not None:
+        record["n"] = n
+    if cond is not None:
+        record["cond"] = cond
+    if seed is not None:
+        record["seed"] = seed
+    if case is not None:
+        record["case"] = case
+    record["threads_per_block"] = threads_per_block
+
+    if plan_record is None:
+        return record
+
+    for field in (
+        "compile_plan_index",
+        "compile_plan_version",
+        "plan_version",
+        "target_backend",
+        "runner",
+        "runner_family",
+        "runner_cwd",
+        "compiled_artifact_kind",
+        "source_artifact_path",
+        "source_sha256",
+        "candidate_id",
+        "template_id",
+        "tile_size",
+        "unroll",
+    ):
+        if field in plan_record:
+            value = plan_record[field]
+            if isinstance(value, (str, int, bool)):
+                record[field] = value
+    return record
+
+
+def _time_input_error_record(
+    *,
+    suite: str,
+    run_plan_manifest_path: Path | None,
+    plan_index: int,
+    result_path: Path,
+    code: str,
+    message: str,
+    warmups: int,
+    repeats: int,
+    max_snippet_chars: int,
+) -> dict[str, object]:
+    record = _time_base_record(
+        suite=suite,
+        plan_record=None,
+        run_plan_manifest_path=run_plan_manifest_path,
+        plan_index=plan_index,
+        result_path=result_path,
+        compiled_artifact_path=None,
+        entry_point=None,
+        launcher_entry_point=None,
+        batch=None,
+        n=None,
+        cond=None,
+        seed=None,
+        case=None,
+        threads_per_block=DEFAULT_THREADS_PER_BLOCK,
+        warmups=warmups,
+        repeats=repeats,
+        max_snippet_chars=max_snippet_chars,
+    )
+    record.update({"status": code, "stderr_snippet": _bounded_text(message, max_chars=max_snippet_chars)})
+    return record
+
+
+def _timing_percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * q
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _timing_summary(elapsed_ns_values: list[int]) -> dict[str, object]:
+    elapsed_us = [value / 1000.0 for value in elapsed_ns_values]
+    mean_us = sum(elapsed_us) / len(elapsed_us) if elapsed_us else 0.0
+    return {
+        "launcher_elapsed_ns_values": elapsed_ns_values,
+        "launcher_elapsed_us_min": min(elapsed_us) if elapsed_us else 0.0,
+        "launcher_elapsed_us_p25": _timing_percentile(elapsed_us, 0.25),
+        "launcher_elapsed_us_p50": _timing_percentile(elapsed_us, 0.5),
+        "launcher_elapsed_us_p75": _timing_percentile(elapsed_us, 0.75),
+        "launcher_elapsed_us_max": max(elapsed_us) if elapsed_us else 0.0,
+        "launcher_elapsed_us_mean": mean_us,
+    }
+
+
+def _time_kernel_record(
+    *,
+    suite: str,
+    plan_record: dict[str, Any] | None,
+    run_plan_manifest_path: Path | None,
+    plan_index: int,
+    result_path: Path,
+    compiled_artifact_path: str,
+    entry_point: str,
+    launcher_entry_point: str | None,
+    batch: int,
+    n: int,
+    cond: int,
+    seed: int,
+    case: str,
+    threads_per_block: int,
+    warmups: int,
+    repeats: int,
+    collect_route_counts: bool,
+    device: str | None,
+    max_snippet_chars: int,
+) -> dict[str, object]:
+    _check_execution_path(compiled_artifact_path, field="compiled_artifact_path", prefix=("data", "qr_v2", "compiled"))
+    _check_execution_path(result_path.as_posix(), field="timing_result_path", prefix=("data", "qr_v2", "timing-results"))
+    if warmups < 0:
+        raise ValueError("warmups must be non-negative")
+    if repeats <= 0:
+        raise ValueError("repeats must be positive")
+
+    launcher_name = launcher_entry_point or f"{entry_point}_launch"
+    record = _time_base_record(
+        suite=suite,
+        plan_record=plan_record,
+        run_plan_manifest_path=run_plan_manifest_path,
+        plan_index=plan_index,
+        result_path=result_path,
+        compiled_artifact_path=compiled_artifact_path,
+        entry_point=entry_point,
+        launcher_entry_point=launcher_name,
+        batch=batch,
+        n=n,
+        cond=cond,
+        seed=seed,
+        case=case,
+        threads_per_block=threads_per_block,
+        warmups=warmups,
+        repeats=repeats,
+        max_snippet_chars=max_snippet_chars,
+    )
+    record["timing_scope"] = "pre_generated_input_host_launcher"
+    record["includes_checker"] = False
+    record["includes_input_generation"] = False
+    record["includes_dynamic_load"] = False
+    _record_artifact_metadata(record, compiled_artifact_path)
+
+    artifact = Path(compiled_artifact_path)
+    if not artifact.exists():
+        record.update(
+            {
+                "status": "missing_compiled_artifact",
+                "stderr_snippet": f"missing compiled artifact: {compiled_artifact_path}",
+            }
+        )
+        return record
+
+    if not torch.cuda.is_available():
+        record.update(
+            {
+                "status": "cuda_unavailable",
+                "stderr_snippet": "torch.cuda.is_available() is false",
+            }
+        )
+        return record
+
+    setup_start_ns = time.perf_counter_ns()
+    try:
+        device_index = _cuda_device_index(device)
+        torch.cuda.set_device(device_index)
+        resolved_device = torch.device("cuda", device_index)
+        record["cuda_device_index"] = device_index
+        record["cuda_device_name"] = torch.cuda.get_device_name(device_index)
+
+        a = generate_input(batch=batch, n=n, cond=cond, seed=seed, case=case, device=resolved_device)
+        h = torch.empty_like(a)
+        tau = torch.empty((batch, n), device=resolved_device, dtype=torch.float32)
+        library = ctypes.CDLL(artifact.as_posix())
+        try:
+            launcher = getattr(library, launcher_name)
+        except AttributeError:
+            elapsed_ns = time.perf_counter_ns() - setup_start_ns
+            record.update(
+                {
+                    "status": "missing_launcher",
+                    "returncode": 127,
+                    "elapsed_ns": elapsed_ns,
+                    "elapsed_ms": elapsed_ns / 1_000_000.0,
+                    "stderr_snippet": f"missing launcher symbol: {launcher_name}",
+                }
+            )
+            return record
+
+        use_route_launcher = launcher_name.endswith("_launch_routes")
+        route_counters = None
+        if use_route_launcher:
+            route_counters = torch.empty((len(ROUTE_COUNTER_FIELDS),), device=resolved_device, dtype=torch.uint64)
+            launcher.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+        else:
+            launcher.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+        launcher.restype = ctypes.c_int
+
+        def launch_once() -> int:
+            if use_route_launcher:
+                assert route_counters is not None
+                return int(
+                    launcher(
+                        ctypes.c_void_p(a.data_ptr()),
+                        ctypes.c_void_p(h.data_ptr()),
+                        ctypes.c_void_p(tau.data_ptr()),
+                        ctypes.c_void_p(route_counters.data_ptr()),
+                        ctypes.c_int(batch),
+                        ctypes.c_int(n),
+                        ctypes.c_int(threads_per_block),
+                        ctypes.c_int(len(ROUTE_COUNTER_FIELDS)),
+                    )
+                )
+            return int(
+                launcher(
+                    ctypes.c_void_p(a.data_ptr()),
+                    ctypes.c_void_p(h.data_ptr()),
+                    ctypes.c_void_p(tau.data_ptr()),
+                    ctypes.c_int(batch),
+                    ctypes.c_int(n),
+                    ctypes.c_int(threads_per_block),
+                )
+            )
+
+        setup_elapsed_ns = time.perf_counter_ns() - setup_start_ns
+        record["setup_elapsed_ns"] = setup_elapsed_ns
+        record["setup_elapsed_ms"] = setup_elapsed_ns / 1_000_000.0
+
+        for warmup_index in range(warmups):
+            returncode = launch_once()
+            if returncode != 0:
+                record.update(
+                    {
+                        "status": "warmup_failed",
+                        "returncode": returncode,
+                        "warmup_index": warmup_index,
+                        "stderr_snippet": f"launcher returned CUDA error code {returncode} during warmup",
+                    }
+                )
+                return record
+
+        torch.cuda.synchronize(resolved_device)
+        elapsed_ns_values: list[int] = []
+        for repeat_index in range(repeats):
+            start_ns = time.perf_counter_ns()
+            returncode = launch_once()
+            elapsed_ns = time.perf_counter_ns() - start_ns
+            if returncode != 0:
+                record.update(
+                    {
+                        "status": "timing_failed",
+                        "returncode": returncode,
+                        "repeat_index": repeat_index,
+                        "elapsed_ns": elapsed_ns,
+                        "elapsed_ms": elapsed_ns / 1_000_000.0,
+                        "stderr_snippet": f"launcher returned CUDA error code {returncode} during timing",
+                    }
+                )
+                return record
+            elapsed_ns_values.append(elapsed_ns)
+
+        record.update(_timing_summary(elapsed_ns_values))
+        record.update(
+            {
+                "ok": True,
+                "status": "timed",
+                "returncode": 0,
+                "elapsed_ns": sum(elapsed_ns_values),
+                "elapsed_ms": sum(elapsed_ns_values) / 1_000_000.0,
+                "stdout_snippet": "",
+                "stderr_snippet": "",
+            }
+        )
+
+        if route_counters is not None:
+            record.update(_route_counter_summary(route_counters))
+        elif collect_route_counts and plan_record is not None and plan_record.get("template_id") in ROUTE_COUNTER_TEMPLATE_IDS:
+            route_launcher_name = f"{entry_point}_launch_routes"
+            try:
+                route_launcher = getattr(library, route_launcher_name)
+            except AttributeError:
+                record["route_counter_status"] = "missing_launcher"
+            else:
+                route_counters = torch.empty((len(ROUTE_COUNTER_FIELDS),), device=resolved_device, dtype=torch.uint64)
+                route_launcher.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                ]
+                route_launcher.restype = ctypes.c_int
+                route_returncode = int(
+                    route_launcher(
+                        ctypes.c_void_p(a.data_ptr()),
+                        ctypes.c_void_p(h.data_ptr()),
+                        ctypes.c_void_p(tau.data_ptr()),
+                        ctypes.c_void_p(route_counters.data_ptr()),
+                        ctypes.c_int(batch),
+                        ctypes.c_int(n),
+                        ctypes.c_int(threads_per_block),
+                        ctypes.c_int(len(ROUTE_COUNTER_FIELDS)),
+                    )
+                )
+                if route_returncode == 0:
+                    record.update(_route_counter_summary(route_counters))
+                    record["route_counter_status"] = "collected"
+                else:
+                    record["route_counter_status"] = "launch_failed"
+                    record["route_counter_returncode"] = route_returncode
+        return record
+    except Exception as error:
+        elapsed_ns = time.perf_counter_ns() - setup_start_ns
+        record.update(
+            {
+                "ok": False,
+                "status": "timing_error",
+                "returncode": 1,
+                "elapsed_ns": elapsed_ns,
+                "elapsed_ms": elapsed_ns / 1_000_000.0,
+                "stderr_snippet": _bounded_text(f"{type(error).__name__}: {error}", max_chars=max_snippet_chars),
+            }
+        )
+        return record
+
+
+def time_one(
+    *,
+    suite: str,
+    compiled_artifact_path: Path,
+    entry_point: str,
+    batch: int,
+    n: int,
+    cond: int,
+    seed: int,
+    case: str,
+    result_path: Path | None = None,
+    launcher_entry_point: str | None = None,
+    threads_per_block: int = DEFAULT_THREADS_PER_BLOCK,
+    warmups: int = DEFAULT_TIMING_WARMUPS,
+    repeats: int = DEFAULT_TIMING_REPEATS,
+    collect_route_counts: bool = False,
+    device: str | None = None,
+    max_snippet_chars: int = DEFAULT_SNIPPET_CHARS,
+) -> TimingExecutionResult:
+    compiled_artifact_text = compiled_artifact_path.as_posix()
+    resolved_result_path = result_path or _timing_result_path_from_artifact(
+        suite=suite,
+        compiled_artifact_path=compiled_artifact_text,
+    )
+    try:
+        record = _time_kernel_record(
+            suite=suite,
+            plan_record=None,
+            run_plan_manifest_path=None,
+            plan_index=0,
+            result_path=resolved_result_path,
+            compiled_artifact_path=compiled_artifact_text,
+            entry_point=entry_point,
+            launcher_entry_point=launcher_entry_point,
+            batch=batch,
+            n=n,
+            cond=cond,
+            seed=seed,
+            case=case,
+            threads_per_block=threads_per_block,
+            warmups=warmups,
+            repeats=repeats,
+            collect_route_counts=collect_route_counts,
+            device=device,
+            max_snippet_chars=max_snippet_chars,
+        )
+    except (OSError, ValueError) as error:
+        record = _time_input_error_record(
+            suite=suite,
+            run_plan_manifest_path=None,
+            plan_index=0,
+            result_path=resolved_result_path,
+            code="timing_input_error",
+            message=str(error),
+            warmups=warmups,
+            repeats=repeats,
+            max_snippet_chars=max_snippet_chars,
+        )
+    return _write_timing_result(resolved_result_path, [record])
+
+
+def time_one_from_plan_manifest(
+    *,
+    suite: str,
+    run_plan_manifest_path: Path,
+    index: int,
+    result_path: Path | None = None,
+    warmups: int = DEFAULT_TIMING_WARMUPS,
+    repeats: int = DEFAULT_TIMING_REPEATS,
+    collect_route_counts: bool = False,
+    device: str | None = None,
+    max_snippet_chars: int = DEFAULT_SNIPPET_CHARS,
+) -> TimingExecutionResult:
+    fallback_result_path = result_path or (Path("data") / "qr_v2" / "timing-results" / suite / "manifest.jsonl")
+    if not run_plan_manifest_path.exists():
+        record = _time_input_error_record(
+            suite=suite,
+            run_plan_manifest_path=run_plan_manifest_path,
+            plan_index=index,
+            result_path=fallback_result_path,
+            code="missing_run_plan",
+            message=f"missing run plan: {run_plan_manifest_path}",
+            warmups=warmups,
+            repeats=repeats,
+            max_snippet_chars=max_snippet_chars,
+        )
+        return _write_timing_result(fallback_result_path, [record])
+
+    try:
+        plan_records = _read_jsonl_objects(run_plan_manifest_path)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        record = _time_input_error_record(
+            suite=suite,
+            run_plan_manifest_path=run_plan_manifest_path,
+            plan_index=index,
+            result_path=fallback_result_path,
+            code="invalid_run_plan",
+            message=str(error),
+            warmups=warmups,
+            repeats=repeats,
+            max_snippet_chars=max_snippet_chars,
+        )
+        return _write_timing_result(fallback_result_path, [record])
+
+    if index < 0 or index >= len(plan_records):
+        record = _time_input_error_record(
+            suite=suite,
+            run_plan_manifest_path=run_plan_manifest_path,
+            plan_index=index,
+            result_path=fallback_result_path,
+            code="run_plan_index_out_of_range",
+            message=f"run plan index {index} is outside 0..{len(plan_records) - 1}",
+            warmups=warmups,
+            repeats=repeats,
+            max_snippet_chars=max_snippet_chars,
+        )
+        return _write_timing_result(fallback_result_path, [record])
+
+    plan_record = plan_records[index]
+    try:
+        compiled_artifact_path = _required_string(plan_record, "compiled_artifact_path")
+        row_result_path = result_path or _timing_result_path_from_artifact(
+            suite=suite,
+            compiled_artifact_path=compiled_artifact_path,
+        )
+        record = _time_kernel_record(
+            suite=suite,
+            plan_record=plan_record,
+            run_plan_manifest_path=run_plan_manifest_path,
+            plan_index=_required_int(plan_record, "plan_index"),
+            result_path=row_result_path,
+            compiled_artifact_path=compiled_artifact_path,
+            entry_point=_required_string(plan_record, "entry_point"),
+            launcher_entry_point=plan_record.get("launcher_entry_point")
+            if isinstance(plan_record.get("launcher_entry_point"), str)
+            else None,
+            batch=_required_int(plan_record, "batch"),
+            n=_required_int(plan_record, "n"),
+            cond=_required_int(plan_record, "cond"),
+            seed=_required_int(plan_record, "seed"),
+            case=_required_string(plan_record, "case"),
+            threads_per_block=_required_int(plan_record, "threads_per_block"),
+            warmups=warmups,
+            repeats=repeats,
+            collect_route_counts=collect_route_counts,
+            device=device,
+            max_snippet_chars=max_snippet_chars,
+        )
+    except (OSError, ValueError) as error:
+        record = _time_input_error_record(
+            suite=suite,
+            run_plan_manifest_path=run_plan_manifest_path,
+            plan_index=index,
+            result_path=fallback_result_path,
+            code="timing_input_error",
+            message=str(error),
+            warmups=warmups,
+            repeats=repeats,
+            max_snippet_chars=max_snippet_chars,
+        )
+        return _write_timing_result(fallback_result_path, [record])
+    return _write_timing_result(Path(str(record["timing_result_path"])), [record])
 
 
 def run_one(
