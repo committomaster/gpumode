@@ -91,7 +91,7 @@ flox activate -- uv run qr-v2 verify-run-results --suite tests
 
 For result summaries, `yq` is available in Flox. `jq` is not installed.
 
-## Latest L4 Results
+## L4 Lightning Studio Results
 
 Host used for setup: NVIDIA L4, driver 580.159.03, CUDA 13.0, target arch `sm_89`.
 
@@ -124,7 +124,7 @@ flox activate -- git diff --check
 
 ## H100 Lightning Studio Results
 
-Host used for the current pass: Lightning.AI Studio with an NVIDIA H100 80GB HBM3, CUDA 13.0 user-space packages from Flox, and host driver 580.142-series. The Studio environment does not provide admin access. Nsight Compute performance counters are locked by the host setting `RmProfilingAdminOnly: 1`, so normal-user `ncu` reports `ERR_NVGPUCTRPERM`. Do not try to run project Python as root just to collect counters.
+Host used for the current pass: Lightning.AI Studio with an NVIDIA H100 80GB HBM3, CUDA 13.0 user-space packages from Flox, and host driver 580.142-series. The Studio environment does not provide admin access. Nsight Compute performance counters are locked by the host setting `RmProfilingAdminOnly: 1`, so normal-user `ncu` reports `ERR_NVGPUCTRPERM`. Cannot run project Python as root to collect counters.
 
 Because NCU counters were unavailable, `parallel_profile` was added with device-side `clock64()` counters. It passed the first-three official `tests` gate on `sm_90`:
 
