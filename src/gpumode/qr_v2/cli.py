@@ -23,6 +23,7 @@ from gpumode.qr_v2.compile_plan import (
     verify_compile_plan_manifest,
 )
 from gpumode.qr_v2.jsonl import append_jsonl, dumps_record, write_jsonl
+from gpumode.qr_v2.mathdx import discover_mathdx, mathdx_compile_args
 from gpumode.qr_v2.probes import run_structure_probe
 from gpumode.qr_v2.render import KERNEL_CONFIGS, RenderSuiteResult, RenderVerificationResult, render_suite, verify_render_manifest
 from gpumode.qr_v2.run import (
@@ -112,6 +113,30 @@ def _run_probe(args: argparse.Namespace) -> int:
     ]
     _write_records(args, records, kind="probes")
     return 0
+
+
+def _run_mathdx_info(args: argparse.Namespace) -> int:
+    discovery = discover_mathdx(project_root=Path("."))
+    record: dict[str, object] = {"event": "mathdx_info", "found": discovery is not None}
+    if discovery is not None:
+        record.update(discovery.to_record())
+        record["compile_args"] = mathdx_compile_args(discovery)
+
+    if args.stdout or not sys.stdout.isatty():
+        print(dumps_record(record))
+        return 0 if discovery is not None else 1
+
+    table = Table(title="mathdx", show_header=False)
+    table.add_column("field", style="bold")
+    table.add_column("value")
+    table.add_row("status", "[green]found[/green]" if discovery is not None else "[bold red]missing[/bold red]")
+    if discovery is not None:
+        table.add_row("root", discovery.root.as_posix())
+        table.add_row("include", discovery.include_dir.as_posix())
+        table.add_row("library", discovery.library_path.as_posix())
+        table.add_row("library kind", discovery.library_kind)
+    Console().print(table)
+    return 0 if discovery is not None else 1
 
 
 def _render_report(result: RenderSuiteResult) -> None:
@@ -237,13 +262,17 @@ def _run_plan_compile(args: argparse.Namespace) -> int:
             _verify_report(verification)
         return 1
 
-    result = plan_compile_from_render_manifest(
-        suite=args.suite,
-        render_manifest_path=render_manifest_path,
-        out_dir=_data_directory_path(args.out, suite=args.suite, kind="compile-plans"),
-        output_root=DATA_DIR / "qr_v2" / "compiled",
-        gpu_arch=args.gpu_arch,
-    )
+    try:
+        result = plan_compile_from_render_manifest(
+            suite=args.suite,
+            render_manifest_path=render_manifest_path,
+            out_dir=_data_directory_path(args.out, suite=args.suite, kind="compile-plans"),
+            output_root=DATA_DIR / "qr_v2" / "compiled",
+            gpu_arch=args.gpu_arch,
+        )
+    except FileNotFoundError as error:
+        print(str(error), file=sys.stderr)
+        return 1
     if args.stdout:
         for record in result.records:
             print(dumps_record(record))
@@ -845,6 +874,10 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--early-stop-max-n", type=int, default=512)
     probe.add_argument("--rank-probe-max-n", type=int, default=512)
     probe.set_defaults(func=_run_probe)
+
+    mathdx_info = subparsers.add_parser("mathdx-info", help="show local MathDx/cuSolverDx discovery state")
+    mathdx_info.add_argument("--stdout", action="store_true")
+    mathdx_info.set_defaults(func=_run_mathdx_info)
 
     render = subparsers.add_parser("render", help="render deterministic qr_v2 candidate artifacts")
     render.add_argument("--suite", choices=("smoke", "tests", "benchmarks"), default="smoke")

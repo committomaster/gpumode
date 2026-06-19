@@ -3,14 +3,10 @@
 !/.flox/
 /.flox/*
 !/.flox/env/
-!/.flox/env/manifest.lock
-!/.flox/env/manifest.toml
+!/.flox/pkgs/
 !/.flox/env.json
 
 !/.vscode/
-/.vscode/*
-!/.vscode/extensions.json
-!/.vscode/settings.json
 
 !/.env
 !/.sops.yaml

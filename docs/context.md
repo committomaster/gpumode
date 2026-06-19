@@ -229,9 +229,9 @@ flox activate -- git diff --check
 
 Treat the current `semantic_combo` and `cusolver` candidates as benchmark-relevant proof points, not as leaderboard-ready implementations.
 
-## Next Steps
+## Earlier H100 Plan
 
-Stay on H100 for more development. Use B200 only after there is a benchmark-relevant candidate worth timing. The next H100 work should target the actual benchmark set from `docs/task.md`:
+Before the move to H200/Verda, the H100 development plan targeted the actual benchmark set from `docs/task.md`:
 
 1. Extend benchmark-relevant semantic routes:
    - Keep the conservative clustered `k=256` route enabled for `clustered n=512, batch=640`; it now passes, but the timing gain is modest because one-block GEQR2 remains the core cost.
@@ -249,19 +249,260 @@ Stay on H100 for more development. Use B200 only after there is a benchmark-rele
    - Use `qr-v2 time-one` for selected benchmark rows; current `run.py` elapsed time includes checker and setup overhead.
    - Once more routes hit benchmark cases, run a H100 benchmark slice and compute a local geometric mean.
 
-Switch to B200 when one of these is true:
+The old B200 gate was to switch only when one of these became true:
 
 - H100 benchmark-suite geomean is plausibly within a few times the 2-4 ms leaderboard range after architectural scaling, or
 - There is a combined candidate with benchmark-relevant routes for rankdef/clustered/mixed/nearrank plus a better dense fallback, and the goal is final timing/tuning.
 
-On B200, first confirm the supported Blackwell target with `nvcc --list-gpu-arch`; do not assume the right `sm_` value. Then run a tight validation/timing slice before the full benchmark suite.
+On B200, first confirm the supported Blackwell target with `nvcc --list-gpu-arch`; do not assume the right `sm_` value. Then run a tight validation/timing slice before the full benchmark suite. As of the current note below, the active host is H200/Verda, not H100.
+
+### Last status note:
+
+Implemented the next dense-backend step.
+
+Added:
+- `cublas_batched`: uses `cublasSgeqrfBatched`.
+- `dense_linalg_best`: dispatch proxy. It originally used cuBLAS batched for `n=32/176/512` and cuSOLVER for `n=352` and `n>=1024`; after the H200 MathDx and blocked-QR work, it uses cuSolverDx for `n=32/176`, a blocked Householder panel path for dense `n=512`, cuBLAS batched for other `n=512` cases, and cuSOLVER for the other larger rows.
+
+Key finding: NVIDIA’s cuBLAS docs say `Aarray`/`TauArray` are device pointer arrays, but `info` is a host scalar. Passing device `info` caused a segfault inside `cublasSgeqrfBatched`; fixed now. Source: https://docs.nvidia.com/cuda/cublas/index.html#cublas-t-geqrfbatched
+
+Validation completed:
+- `cublas_batched` passed first-three `tests`.
+- `dense_linalg_best` passed all 12 official benchmark rows via checked runs, either full slice or individual rows.
+- Full 12-row H100 checker-free timing geomean for `dense_linalg_best`: `100,524.402 us`.
+
+Best full benchmark timings:
+```text
+n=32:        611.090 us
+n=176:    15,498.664 us
+n=352:    42,476.032 us
+n=512:   501,143.892 us
+n=1024:  231,468.449 us
+n=2048:   74,897.064 us
+n=4096:   48,025.212 us
+mixed512: 473,392.086 us
+mixed1024:231,734.992 us
+rankdef:  498,899.915 us
+clustered:500,882.730 us
+nearrank: 231,400.433 us
+```
+
+Follow-up verification after this note:
+
+```sh
+flox activate -- uv run ruff check .
+flox activate -- uv run ty check
+flox activate -- git diff --check
+```
+
+All three passed. The normal sandbox hit Flox's read-only metrics initialization issue, so the commands were rerun with escalation as the Studio user.
+
+### Current H200/Verda status note:
+
+The active host is now an NVIDIA H200 instance on Verda.com. Use `sm_90` for this host. Treat older H100 timings as historical; do not blend them with new H200 timing records without labeling the host.
+
+MathDx/cuSolverDx integration is now on the Flox package-build path:
+
+- `.flox/pkgs/mathdx.nix`: packages NVIDIA MathDx `26.03.0-cuda13` with pinned `fetchurl` hash `sha256-lcJ0QFEC9qJj956wREe9dTn2bOZJd5vY4iX8uMxxWU0=`.
+- `src/gpumode/qr_v2/mathdx.py`: discovers MathDx only from package-style outputs: `$FLOX_ENV` after a published/installed package, or `result-mathdx` after `flox build mathdx`.
+- `qr-v2 mathdx-info --stdout`: reports whether MathDx is visible and which compile flags will be used.
+- `compile_plan.py`: adds NVIDIA's required `-dlto`, MathDx include path, and the packaged cuSolverDx library only for rendered artifacts that include `cusolverdx.hpp`.
+- `docs/mathdx.md`: documents the Flox/Nix package-build route with `.flox/pkgs/mathdx.nix`, not a loose local unpack.
+- `render.py`: adds candidate `cusolverdx`, using cuSolverDx GEQRF for `n=32` and `n=176` rows, with existing host cuSOLVER fallback for larger rows.
+
+Flox catalog searches for `mathdx`, `cusolverdx`, `commonDx`, and `cublasDx` returned no package on this environment. `flox-cuda/cudaPackages_13_0.cutlass@3.9.2` exists, but NVIDIA's cuSolverDx docs say cuSolverDx is distributed as part of the MathDx package, which also ships commonDx and CUTLASS headers required by `cusolverdx.hpp`.
+
+The Flox package has been built locally:
+
+```sh
+flox build mathdx
+```
+
+That creates `result-mathdx`, where `qr-v2 mathdx-info --stdout` detects:
+
+```json
+{"compile_args":["-dlto","-Iresult-mathdx/include","-Iresult-mathdx/external/cutlass/include","-Lresult-mathdx/lib","-lcusolverdx"],"event":"mathdx_info","found":true,"include_dir":"result-mathdx/include","lib_dir":"result-mathdx/lib","library_kind":"static","library_path":"result-mathdx/lib/libcusolverdx.a","root":"result-mathdx"}
+```
+
+Current cuSolverDx slice verification on H200:
+
+```sh
+flox activate -- uv run qr-v2 render --suite tests --limit 3 --candidate cusolverdx
+flox activate -- uv run qr-v2 verify-renders --suite tests
+flox activate -- uv run qr-v2 mathdx-info --stdout
+flox activate -- uv run qr-v2 plan-compile --suite tests --gpu-arch sm_90
+flox activate -- uv run qr-v2 verify-compile-plan --suite tests
+flox activate -- uv run qr-v2 compile --suite tests --timeout-seconds 180
+flox activate -- uv run qr-v2 verify-compile-results --suite tests
+flox activate -- uv run qr-v2 plan-run --suite tests
+flox activate -- uv run qr-v2 verify-run-plan --suite tests
+flox activate -- uv run qr-v2 run --suite tests --limit 3
+flox activate -- uv run qr-v2 verify-run-results --suite tests
+```
+
+All passed. The generated `n=32` and `n=176` rows compile against cuSolverDx and pass checked execution; the `n=352` row uses the existing cuSOLVER fallback and also passes.
+
+Checker-free `time-one` snapshots on H200 with 3 warmups and 10 repeats:
+
+```text
+tests dense n=32,  batch=20: p50 20.525 us, cuSolverDx
+tests dense n=176, batch=40: p50 1,402.185 us, cuSolverDx
+tests dense n=352, batch=40: p50 41,071.303 us, cuSOLVER fallback
+```
+
+Fresh H200 comparison against the previous `dense_linalg_best` routing showed cuSolverDx should be folded into the dispatch candidate:
+
+```text
+previous dense_linalg_best:
+  n=32:  p50 2,658.579 us, cuBLAS batched
+  n=176: p50 34,395.735 us, cuBLAS batched
+  n=352: p50 41,098.792 us, cuSOLVER fallback
+
+updated dense_linalg_best:
+  n=32:  p50 20.525 us, cuSolverDx
+  n=176: p50 1,695.954 us, cuSolverDx
+  n=352: p50 41,092.702 us, cuSOLVER fallback
+```
+
+The next cuSolverDx size probe, `n=352`, was not viable on H200/SM90. Rendering the standalone `cusolverdx` candidate through `n=352` failed at compile time with NVIDIA MathDx's static assertion that the data type and size combination does not fit the shared memory available for block execution. Keep the cuSolverDx threshold at `n <= 176` unless a different cuSolverDx execution mode or tiling strategy is introduced.
+
+Updated `dense_linalg_best` passed the first four dense benchmark rows on H200. Checker-free `time-one` snapshots with 3 warmups and 10 repeats:
+
+```text
+benchmarks dense n=32,  batch=20:  p50 20.525 us, cuSolverDx
+benchmarks dense n=176, batch=40:  p50 3,800.783 us, cuSolverDx
+benchmarks dense n=352, batch=40:  p50 89,680.683 us, cuSOLVER fallback
+benchmarks dense n=512, batch=640: p50 500,076.771 us, cuBLAS batched
+first-four dense geomean: 7,690.825 us
+```
+
+Lane 2 dense work then added a proper blocked Householder QR prototype for dense `n=512` and `n=1024`: factor width-16 panels with cuBLAS batched panel QR, build the triangular block factor, and apply each block reflector with batched GEMM updates. It passes the official dense `n=512, batch=640` and `n=1024, batch=60` benchmark rows and is folded into `dense_linalg_best` for those dense rows.
+
+Panel-width bracket on H200 for benchmark dense `n=512, batch=640`:
+
+```text
+panel 8:  p50 34,666.291 us
+panel 16: p50 28,460.063 us
+panel 32: p50 36,879.027 us
+```
+
+The dense `n=1024, batch=60` row improved from the cuSOLVER fallback p50 of `228,329.322 us` to the blocked QR p50 of `40,053.163 us`.
+
+Integrated `dense_linalg_best` first-five dense benchmark timings on H200 with 5 warmups and 20 repeats, measured sequentially:
+
+```text
+benchmarks dense n=32,   batch=20:  p50 20.060 us, cuSolverDx
+benchmarks dense n=176,  batch=40:  p50 1,403.769 us, cuSolverDx
+benchmarks dense n=352,  batch=40:  p50 41,095.626 us, cuSOLVER fallback
+benchmarks dense n=512,  batch=640: p50 28,468.848 us, blocked panel-16 QR
+benchmarks dense n=1024, batch=60:  p50 40,053.163 us, blocked panel-16 QR
+first-five dense geomean: 4,208.097 us
+```
+
+The integrated `dense_linalg_best` first-five official `tests` manifest was refreshed on H200 after the `n=1024` promotion:
+
+```sh
+flox activate -- uv run qr-v2 render --suite tests --limit 5 --candidate dense_linalg_best
+flox activate -- uv run qr-v2 verify-renders --suite tests
+flox activate -- uv run qr-v2 plan-compile --suite tests --gpu-arch sm_90
+flox activate -- uv run qr-v2 verify-compile-plan --suite tests
+flox activate -- uv run qr-v2 compile --suite tests --timeout-seconds 300
+flox activate -- uv run qr-v2 verify-compile-results --suite tests
+flox activate -- uv run qr-v2 plan-run --suite tests
+flox activate -- uv run qr-v2 verify-run-plan --suite tests
+flox activate -- uv run qr-v2 run --suite tests --limit 5
+flox activate -- uv run qr-v2 verify-run-results --suite tests
+```
+
+All passed. Final handoff checks also passed:
+
+```sh
+flox activate -- uv run ruff check .
+flox activate -- uv run ty check
+git diff --check
+```
+
+The repository wording audit for the disallowed kernel-launch hint family returned no matches.
+
+Dense `n=2048` blocked-QR probe on H200:
+
+- Test row `n=2048, batch=2, cond=2` compiled and passed checked execution on the blocked panel-16 path.
+- Official benchmark row `n=2048, batch=8, cond=1` also compiled and passed checked execution on the blocked panel-16 path.
+- Checker-free timing with 5 warmups and 20 repeats was slower than cuSOLVER on the same H200 row:
+
+```text
+blocked panel-16 QR: p50 108,327.829 us
+cuSOLVER fallback:   p50  73,311.086 us
+```
+
+Conclusion: do not promote blocked QR for dense `n=2048`; keep the cuSOLVER fallback for that row unless a different blocked/update strategy is added.
+
+Pre-promotion structured-row H200 comparison, 2 warmups and 5 repeats:
+
+```text
+row  case       n     batch  dense_linalg_best p50  semantic_combo p50  semantic routes
+7    mixed      512   640       499,876.635 us    2,670,586.769 us  early=57, zero_tail=51, fallback=532
+8    mixed      1024  60        229,590.422 us    1,752,004.138 us  zero_tail=4, fallback=56
+9    rankdef    512   640       499,358.842 us    1,826,577.010 us  zero_tail=640
+10   clustered  512   640       499,926.017 us    2,584,820.789 us  early=640
+11   nearrank   1024  60        228,589.741 us    1,752,568.907 us  fallback=60
+```
+
+Conclusion: do not combine in the old `semantic_combo` implementation directly. Its route decisions are useful evidence, but the fallback/core QR is much slower than the library-backed dense dispatch. The next semantic attempt should put the zero-tail and early-stop reductions on top of a library-backed panel/block path, or use `dense_linalg_best` for all official structured rows until that hybrid exists.
+
+Structured blocked-WY probe then validated the simpler next step: use the blocked panel-16 QR core for all official `n=512` and `n=1024` rows, not only dense rows. The probe candidate passed checked execution for benchmark rows 7-11:
+
+```text
+row  case       n     batch  blocked panel-16 QR p50
+7    mixed      512   640       28,531.823 us
+8    mixed      1024  60        40,240.168 us
+9    rankdef    512   640       28,320.749 us
+10   clustered  512   640       28,503.128 us
+11   nearrank   1024  60        40,154.099 us
+```
+
+The blocked QR launcher now reuses its cuBLAS handle and device work buffers inside each generated artifact. That trims the repeated-launch p50s for `n=512/1024` rows. A later atomic probe promoted dense `n=352` to cached blocked QR with panel width 8; panel bracketing on the official benchmark row showed:
+
+```text
+n=352 panel 8:  p50  4,473.768 us
+n=352 panel 16: p50  6,399.728 us
+n=352 panel 32: p50 11,546.938 us
+```
+
+The promoted `dense_linalg_best` row for benchmark `n=352, batch=40` passed checked execution and timed at `4,486.118 us` p50. This drops the current 12-row H200 geomean estimate from `41,985.158 us` to `12,173.971 us` using the measured row p50s:
+
+```text
+0 dense n=32:        20.060 us
+1 dense n=176:    1,403.769 us
+2 dense n=352:    4,486.118 us
+3 dense n=512:   25,503.413 us
+4 dense n=1024:  38,619.475 us
+5 dense n=2048:  73,311.086 us
+6 dense n=4096:  47,354.265 us
+7 mixed n=512:   25,491.320 us
+8 mixed n=1024:  38,602.679 us
+9 rankdef n=512: 25,385.264 us
+10 cluster n=512:25,457.409 us
+11 nearrank1024: 38,578.981 us
+```
+
+`dense_linalg_best` has been promoted accordingly: it now uses cuSolverDx for `n <= 176`, cached-workspace blocked QR with panel 8 for `n=352`, cached-workspace blocked panel-16 QR for every `n=512` and `n=1024` row, and cuSOLVER fallback for the remaining larger rows. After the `n=352` promotion, the full 22-row official `tests` suite rendered, compiled, ran, and verified successfully on H200 with `sm_90`. The benchmark `n=352` row also rendered, compiled, passed checked execution, and timed successfully. Full 12-row benchmark revalidation after the `n=352` promotion is the first resume item; the run was interrupted by the command-execution usage limit immediately after benchmark render verification.
+
+Next concrete steps:
+
+1. Resume by running full 12-row benchmark compile/run/verify for the promoted `dense_linalg_best` manifest.
+2. Profile/tune the blocked QR path: replace the custom T builder if it becomes visible in profiling, and inspect whether the repeated `cublasSgeqrfBatched` panel calls or the three GEMM updates dominate.
+3. Build semantic reductions only on top of the promoted blocked/library-backed path; the old `semantic_combo` core is not competitive on H200.
+4. Attack the remaining slow rows: `n=2048` and `n=4096`. The current panel-16 blocked path is not the right `n=2048` replacement, so this needs a different large-row strategy.
+5. If the package should be shared across machines, publish `mathdx` to a private Flox catalog and install it into the environment so `$FLOX_ENV` contains the SDK instead of relying on the local `result-mathdx` build output.
+6. Rerun `ruff`, `ty`, `git diff --check`, and the repository wording audit before handing off or committing.
 
 ## Gotchas
 
 - The worktree is intentionally dirty during this session; do not reset unrelated changes.
 - Run commands through Flox from the repo root: `flox activate -- ...`. Do not fall back to system-wide Python or packages unless Flox truly lacks the tool.
 - In this Lightning Studio, the normal command sandbox may fail with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`; escalated command execution has been needed, but commands should still run as the Studio user and inside Flox.
-- `plan-compile` defaults to `sm_89`; pass `--gpu-arch sm_90` on H100. On B200, confirm the target with `nvcc --list-gpu-arch`.
+- `plan-compile` defaults to `sm_89`; pass `--gpu-arch sm_90` on H100/H200. On B200, confirm the target with `nvcc --list-gpu-arch`.
 - Nsight Compute performance counters are unavailable without admin/host changes in this Studio; prefer device-side instrumentation or ordinary wall-clock timing.
 - No `pytest` dependency has been added yet; verification is CLI/manifests/JSONL-first.
 - Keep generated artifacts under `data/qr_v2/`.

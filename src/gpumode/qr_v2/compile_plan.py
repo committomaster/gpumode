@@ -8,13 +8,21 @@ from pathlib import Path
 from typing import Any
 
 from gpumode.qr_v2.jsonl import write_jsonl
+from gpumode.qr_v2.mathdx import discover_mathdx, mathdx_compile_args
 
 
 COMPILE_PLAN_VERSION = "compile_plan_v1"
 CUSOLVER_TEMPLATE_IDS = frozenset({"cuda_cusolver_geqrf_v1"})
 CUBLAS_TEMPLATE_IDS = frozenset({"cuda_cublas_batched_geqrf_v1"})
-DENSE_LINALG_TEMPLATE_IDS = frozenset({"cuda_dense_linalg_best_v1"})
-CUDA_LINALG_TEMPLATE_IDS = CUSOLVER_TEMPLATE_IDS | CUBLAS_TEMPLATE_IDS | DENSE_LINALG_TEMPLATE_IDS
+DENSE_LINALG_TEMPLATE_IDS = frozenset(
+    {
+        "cuda_dense_linalg_best_v1",
+        "cuda_dense_blocked_wy_v1",
+        "cuda_structured_blocked_wy_v1",
+    }
+)
+CUSOLVERDX_TEMPLATE_IDS = frozenset({"cuda_cusolverdx_geqrf_v1"})
+CUDA_LINALG_TEMPLATE_IDS = CUSOLVER_TEMPLATE_IDS | CUBLAS_TEMPLATE_IDS | DENSE_LINALG_TEMPLATE_IDS | CUSOLVERDX_TEMPLATE_IDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +102,11 @@ def _compile_output_path(*, suite: str, candidate_id: str, artifact_path: str, o
     return output_root / suite / candidate_id / stem
 
 
+def _source_uses_mathdx(artifact_path: str, template_id: str) -> bool:
+    path = Path(artifact_path)
+    return path.exists() and "cusolverdx.hpp" in path.read_text(encoding="utf-8", errors="ignore")
+
+
 def _compile_argv(*, artifact_path: str, output_path: Path, gpu_arch: str, template_id: str) -> list[str]:
     argv = [
         "nvcc",
@@ -108,7 +121,11 @@ def _compile_argv(*, artifact_path: str, output_path: Path, gpu_arch: str, templ
         artifact_path,
     ]
     if template_id in CUDA_LINALG_TEMPLATE_IDS:
-        uses_cusolver = template_id in CUSOLVER_TEMPLATE_IDS or template_id in DENSE_LINALG_TEMPLATE_IDS
+        uses_cusolver = (
+            template_id in CUSOLVER_TEMPLATE_IDS
+            or template_id in DENSE_LINALG_TEMPLATE_IDS
+            or template_id in CUSOLVERDX_TEMPLATE_IDS
+        )
         required_header = "cusolverDn.h" if uses_cusolver else "cublas_v2.h"
         required_library = "libcusolver.so.12" if uses_cusolver else "libcublas.so.13"
         link_libraries = ["-l:libcusolver.so.12", "-l:libcublas.so.13"] if uses_cusolver else ["-l:libcublas.so.13"]
@@ -140,6 +157,14 @@ def _compile_argv(*, artifact_path: str, output_path: Path, gpu_arch: str, templ
             "-Xlinker",
             cuda_rpath,
         ])
+    if _source_uses_mathdx(artifact_path, template_id):
+        mathdx = discover_mathdx(project_root=Path("."))
+        if mathdx is None:
+            raise FileNotFoundError(
+                "MathDx/cuSolverDx was not found. Build the Flox MathDx package so result-mathdx exists, "
+                "or install/publish that package so cusolverdx.hpp and libcusolverdx are under $FLOX_ENV."
+            )
+        argv.extend(mathdx_compile_args(mathdx))
     return argv
 
 
